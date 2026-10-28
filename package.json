@@ -1,0 +1,36 @@
+{
+  "name": "yuripay-docs",
+  "private": true,
+  "version": "1.2.0",
+  "type": "module",
+  "description": "Enterprise Self-Hosted Dynamic QRIS Payment Gateway for GoBiz Merchants - Documentation & Simulator by myzert",
+  "homepage": "https://yuripay.pages.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/myzert/YURIPAY-GOPAY.git"
+  },
+  "keywords": [
+    "yuripay",
+    "myzert",
+    "qris",
+    "qris-dinamis",
+    "gobiz",
+    "gopay",
+    "payment-gateway",
+    "self-hosted",
+    "midtrans-webhook",
+    "emvco",
+    "crc16"
+  ],
+  "author": "myzert (YuriDev)",
+  "license": "ISC",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "~7.0.2",
+    "vite": "^8.3.5"
+  }
+}

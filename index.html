@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="id" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    
+    <!-- Primary SEO Meta Tags -->
+    <title>⚡ YURIPAY by myzert - Enterprise Self-Hosted Dynamic QRIS Payment Gateway for GoBiz Merchants</title>
+    <meta name="title" content="⚡ YURIPAY by myzert - Enterprise Self-Hosted Dynamic QRIS Payment Gateway for GoBiz Merchants" />
+    <meta name="description" content="Dokumentasi resmi YURIPAY by myzert. Payment gateway QRIS dinamis mandiri (self-hosted) untuk merchant GoBiz. 0% fee potongan pihak ketiga, mutasi realtime 2.5s, webhook Midtrans SHA-512, arsitektur Dual-Port, dan EMVCo CRC-16." />
+    <meta name="keywords" content="yuripay, myzert, yuridev, qris dinamis, gopay merchant, gobiz gateway, payment gateway self-hosted, emvco crc16, midtrans webhook sha512, qris termux, vps qris nodejs, cpanel nodejs qris, payment gateway indonesia" />
+    <meta name="author" content="myzert (YuriDev)" />
+    <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+    
+    <!-- Canonical & Alternate URLs -->
+    <link rel="canonical" href="https://yuripay.pages.dev/" />
+    <link rel="alternate" hreflang="id" href="https://yuripay.pages.dev/" />
+    <link rel="alternate" hreflang="x-default" href="https://yuripay.projectt.my.id/" />
+    
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://yuripay.pages.dev/" />
+    <meta property="og:site_name" content="YURIPAY by myzert" />
+    <meta property="og:title" content="⚡ YURIPAY - Enterprise Self-Hosted Dynamic QRIS Gateway for GoBiz" />
+    <meta property="og:description" content="Payment gateway QRIS dinamis mandiri (self-hosted) dengan 0% fee, dual-port isolation, pencocokan mutasi 2.5s, dan webhook Midtrans SHA-512." />
+    <meta property="og:image" content="https://raw.githubusercontent.com/myzert/yuripay/main/public/images/thank-you.webp" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="YuriPay by myzert Logo Banner" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:url" content="https://yuripay.pages.dev/" />
+    <meta name="twitter:title" content="⚡ YURIPAY by myzert - Enterprise Dynamic QRIS Gateway" />
+    <meta name="twitter:description" content="Self-hosted Dynamic QRIS payment gateway for GoBiz merchants. 0% fee, Dual-Port, Midtrans SHA-512 Webhook." />
+    <meta name="twitter:image" content="https://raw.githubusercontent.com/myzert/yuripay/main/public/images/thank-you.webp" />
+
+    <!-- Favicon & Mobile Icons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#0284c7" />
+
+    <!-- Google Fonts & Preconnect -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+    <!-- Schema.org Structured Data (JSON-LD) for SEO Rich Snippets -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "SoftwareApplication",
+          "@id": "https://yuripay.pages.dev/#software",
+          "name": "YURIPAY by myzert",
+          "operatingSystem": "Linux (Ubuntu/Debian), Docker, cPanel Node.js Selector, Termux Android",
+          "applicationCategory": "BusinessApplication, FinanceApplication",
+          "description": "Enterprise Self-Hosted Dynamic QRIS Payment Gateway for GoBiz Merchants with Dual-Port Isolation and Midtrans SHA-512 Webhook Engine.",
+          "offers": {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "IDR"
+          },
+          "author": {
+            "@type": "Person",
+            "name": "myzert (YuriDev)",
+            "url": "https://github.com/myzert"
+          },
+          "url": "https://yuripay.pages.dev/",
+          "codeRepository": "https://github.com/myzert/YURIPAY-GOPAY"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://yuripay.pages.dev/#org",
+          "name": "YuriDev",
+          "url": "https://yuripay.pages.dev/",
+          "sameAs": [
+            "https://github.com/myzert/YURIPAY-GOPAY",
+            "https://t.me/ahmadzakiyo",
+            "https://t.me/nuxysproject"
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://yuripay.pages.dev/#website",
+          "url": "https://yuripay.pages.dev/",
+          "name": "YuriPay Documentation & Interactive Simulator",
+          "publisher": {
+            "@id": "https://yuripay.pages.dev/#org"
+          }
+        },
+        {
+          "@type": "FAQPage",
+          "@id": "https://yuripay.pages.dev/#faq",
+          "mainEntity": [
+            {
+              "@type": "Question",
+              "name": "Mengapa YuriPay tidak dapat di-deploy di Vercel atau Serverless?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "YuriPay membutuhkan proses worker stateful yang berjalan 24/7 untuk mencocokkan mutasi GoPay setiap 2.5 detik dan menjaga persistensi database SQLite WAL. Serverless membekukan container setelah respons HTTP selesai dikirim dan memiliki filesystem ephemeral."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Berapa lama token sesi GoBiz bertahan?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Token sesi GoBiz bertahan hingga 30 hari dan YuriPay dilengkapi fitur auto-refresh token di latar belakang setiap 6 jam sehingga Anda tidak perlu login ulang berulang kali."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Bagaimana cara kerja penambahan kode unik +1 perak?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Untuk nominal di bawah Rp 1.000, YuriPay menambahkan offset tetap +1 perak (contoh Rp 500 jadi Rp 501). Untuk nominal Rp 1.000 ke atas, offset acak antara 1 s/d 199 perak digunakan dengan pencegahan tabrakan (collision prevention) otomatis."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Apakah notifikasi webhook YuriPay kompatibel dengan Midtrans?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Ya, 100% identik dengan skema Midtrans, termasuk kalkulasi signature SHA512(order_id + status_code + gross_amount + ServerKey)."
+              }
+            }
+          ]
+        }
+      ]
+    }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

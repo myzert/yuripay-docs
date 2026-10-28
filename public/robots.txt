@@ -1,0 +1,10 @@
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Allow: /
+
+# Host
+Host: https://yuripay.pages.dev
+
+# Sitemaps
+Sitemap: https://yuripay.pages.dev/sitemap.xml
+Sitemap: https://yuripay.projectt.my.id/sitemap.xml
