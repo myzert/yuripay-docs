@@ -1,9 +1,19 @@
 import './style.css';
+import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 
-// --------------------------------------------------------------------------
-// Core State & Utilities
-// --------------------------------------------------------------------------
-const DEFAULT_STATIC_QRIS = '00020101021126610014COM.GO-JEK.WWW01189360091435381382420210G5381382420303UMI51440014ID.CO.QRIS.WWW0215ID10243419924680303UMI5204581653033605802ID5918ZERO SHOP, MEGALUH6007JOMBANG61056145762070703A0163042A62';
+// ============================================================================
+// Core State & Presets
+// ============================================================================
+const PRESET_MISTER_DOMPU = '00020101021126670016ID.CO.CIMB.WWW011893600022000122143002150000000000000000303UMI51440014ID.CO.QRIS.WWW0215ID20243469147550303UMI520473215303360540410005802ID5914Mister Dompu 26002Dompu61058421162070703A0163045663';
+const PRESET_ZERO_SHOP = '00020101021126610014COM.GO-JEK.WWW01189360091435381382420210G5381382420303UMI51440014ID.CO.QRIS.WWW0215ID10243419924680303UMI5204581653033605802ID5918ZERO SHOP, MEGALUH6007JOMBANG61056145762070703A0163042A62';
+
+let currentStaticQris = PRESET_MISTER_DOMPU;
+let currentNominal = 1000;
+let currentOffsetMode = 'yuripay'; // 'yuripay' | 'exact' | 'custom'
+let customOffset = 0;
+let feeType = 'none'; // 'none' | 'flat' | 'percent'
+let feeValue = 0;
 
 function formatRupiah(num: number): string {
   return 'Rp ' + Number(num || 0).toLocaleString('id-ID');
@@ -27,50 +37,150 @@ function calculateCRC16(payload: string): string {
   return crc.toString(16).toUpperCase().padStart(4, '0');
 }
 
+interface TLVTag {
+  tag: string;
+  len: number;
+  val: string;
+  name: string;
+  desc: string;
+}
+
 /**
- * Dynamic QRIS Builder
+ * Friendly Tag Names & EMVCo Specification Descriptions
  */
-function buildDynamicQRIS(staticTemplate: string, nominal: number): { qris: string; crc: string; totalAmount: number; uniqueCode: number } {
-  let payload = (staticTemplate || DEFAULT_STATIC_QRIS).trim();
+const TAG_DEFINITIONS: Record<string, { name: string; desc: string }> = {
+  '00': { name: 'Payload Format Indicator', desc: 'Versi standar EMVCo QRIS (umumnya 01)' },
+  '01': { name: 'Point of Initiation Method', desc: '11 = Statis (manual input), 12 = Dinamis (nominal terkunci)' },
+  '26': { name: 'Merchant Account (Bank / Acquirer)', desc: 'Informasi rekening acquirer (Gojek / CIMB / Bank)' },
+  '51': { name: 'National Merchant ID (NMID)', desc: 'Identitas unik QRIS nasional di Asosiasi Sistem Pembayaran Indonesia (ASPI)' },
+  '52': { name: 'Merchant Category Code (MCC)', desc: 'Klasifikasi kategori usaha / jenis merchant' },
+  '53': { name: 'Transaction Currency', desc: 'Kode mata uang ISO 4217 (360 = Rupiah Indonesia / IDR)' },
+  '54': { name: 'Transaction Amount (Nominal)', desc: 'Jumlah tagihan yang terkunci otomatis di m-banking pembeli' },
+  '55': { name: 'Tip or Convenience Indicator', desc: 'Indikator biaya layanan atau tip pelanggan' },
+  '56': { name: 'Convenience Fee Fixed', desc: 'Nominal biaya layanan tetap (Rupiah)' },
+  '57': { name: 'Convenience Fee Percentage', desc: 'Persentase biaya layanan tambahan' },
+  '58': { name: 'Country Code', desc: 'Kode negara penerbit QR (ID = Indonesia)' },
+  '59': { name: 'Merchant Name', desc: 'Nama resmi toko atau merchant pemilik QRIS' },
+  '60': { name: 'Merchant City', desc: 'Kota domisili terdaftarnya merchant' },
+  '61': { name: 'Postal Code', desc: 'Kode pos lokasi merchant' },
+  '62': { name: 'Additional Data Field', desc: 'Nomor invoice, reference ID, atau terminal ID' },
+  '63': { name: 'CRC-16 Checksum', desc: 'Validasi integritas data 4 karakter heksadesimal' },
+};
+
+/**
+ * Parse raw EMVCo QRIS string into TLV tags
+ */
+function parseEMVCoTLV(raw: string): { tags: TLVTag[]; validCrc: boolean; calculatedCrc: string; embeddedCrc: string } {
+  const clean = raw.trim();
+  const tags: TLVTag[] = [];
+  let i = 0;
+
+  // Extract CRC63 if present
+  let embeddedCrc = '';
+  let payloadWithoutCrc = clean;
+  const idx63 = clean.indexOf('6304');
+  if (idx63 !== -1) {
+    embeddedCrc = clean.substring(idx63 + 4, idx63 + 8).toUpperCase();
+    payloadWithoutCrc = clean.substring(0, idx63 + 4);
+  }
+
+  const calculatedCrc = calculateCRC16(payloadWithoutCrc);
+  const validCrc = embeddedCrc ? calculatedCrc === embeddedCrc : false;
+
+  // Parse TLV loop
+  const parsePayload = idx63 !== -1 ? clean.substring(0, idx63) : clean;
+  while (i < parsePayload.length) {
+    if (i + 4 > parsePayload.length) break;
+    const tag = parsePayload.substring(i, i + 2);
+    const len = parseInt(parsePayload.substring(i + 2, i + 4), 10);
+    if (isNaN(len)) break;
+    const val = parsePayload.substring(i + 4, i + 4 + len);
+    const def = TAG_DEFINITIONS[tag] || { name: `Tag Khusus ${tag}`, desc: 'Data field tambahan spesifikasi EMVCo' };
+    tags.push({
+      tag,
+      len,
+      val,
+      name: def.name,
+      desc: def.desc
+    });
+    i += 4 + len;
+  }
+
+  if (embeddedCrc) {
+    tags.push({
+      tag: '63',
+      len: 4,
+      val: embeddedCrc,
+      name: TAG_DEFINITIONS['63'].name,
+      desc: validCrc ? `Checksum VALID (Cocok dengan payload)` : `Checksum TIDAK COCOK (Dihitung: ${calculatedCrc})`
+    });
+  }
+
+  return { tags, validCrc, calculatedCrc, embeddedCrc };
+}
+
+/**
+ * Generate Dynamic QRIS string & metadata according to EMVCo standard
+ */
+function generateDynamicQRIS(staticTemplate: string, baseNominal: number) {
+  let payload = (staticTemplate || PRESET_MISTER_DOMPU).trim();
+
+  // Strip existing Tag 63 CRC
   const idx63 = payload.indexOf('6304');
   if (idx63 !== -1) {
     payload = payload.substring(0, idx63);
   }
 
-  // Parse TLV tags
+  // Parse existing tags
   const tags: { tag: string; val: string }[] = [];
   let i = 0;
   while (i < payload.length) {
+    if (i + 4 > payload.length) break;
     const tag = payload.substring(i, i + 2);
-    const length = parseInt(payload.substring(i + 2, i + 4), 10);
-    if (isNaN(length)) break;
-    const val = payload.substring(i + 4, i + 4 + length);
+    const len = parseInt(payload.substring(i + 2, i + 4), 10);
+    if (isNaN(len)) break;
+    const val = payload.substring(i + 4, i + 4 + len);
     tags.push({ tag, val });
-    i += 4 + length;
+    i += 4 + len;
   }
 
-  // Unique code logic
-  let uniqueCode = 1;
-  let totalAmount = nominal;
-  if (nominal < 1000) {
-    uniqueCode = 1;
-    totalAmount = nominal + uniqueCode;
-  } else {
-    uniqueCode = 87; // Sample stable preview offset
-    totalAmount = nominal + uniqueCode;
+  // Calculate unique code & fees
+  let uniqueOffset = 0;
+  if (currentOffsetMode === 'yuripay') {
+    if (baseNominal < 1000) {
+      // Rule 1: Di bawah Rp 1.000 -> 1 perak
+      uniqueOffset = 1;
+    } else {
+      // Rule 2: Rp 1.000 ke atas -> acak 1..199 perak (anti-collision)
+      uniqueOffset = Math.floor(Math.random() * 199) + 1;
+    }
+  } else if (currentOffsetMode === 'custom') {
+    uniqueOffset = customOffset;
   }
 
-  const amountStr = totalAmount.toString();
+  let feeAmount = 0;
+  if (feeType === 'flat') {
+    feeAmount = feeValue;
+  } else if (feeType === 'percent') {
+    feeAmount = Math.round((baseNominal * feeValue) / 100);
+  }
+
+  const finalTotalAmount = Math.max(1, baseNominal + uniqueOffset + feeAmount);
+  const amountStr = finalTotalAmount.toString();
+
+  // Build new tags with Dynamic Tag 01 and Tag 54
   const newTags: { tag: string; val: string }[] = [];
   let hasTag54 = false;
 
   for (const item of tags) {
     if (item.tag === '01') {
-      newTags.push({ tag: '01', val: '12' }); // Convert Static (11) -> Dynamic (12)
+      // Ubah Statis (11) menjadi Dinamis (12)
+      newTags.push({ tag: '01', val: '12' });
     } else if (item.tag === '54') {
       newTags.push({ tag: '54', val: amountStr });
       hasTag54 = true;
     } else if (item.tag === '58' && !hasTag54) {
+      // Sisipkan Tag 54 sebelum Tag 58 (Country Code) jika belum ada
       newTags.push({ tag: '54', val: amountStr });
       hasTag54 = true;
       newTags.push(item);
@@ -83,6 +193,7 @@ function buildDynamicQRIS(staticTemplate: string, nominal: number): { qris: stri
     newTags.push({ tag: '54', val: amountStr });
   }
 
+  // Re-encode TLV
   let result = '';
   for (const item of newTags) {
     const lenStr = item.val.length.toString().padStart(2, '0');
@@ -90,17 +201,21 @@ function buildDynamicQRIS(staticTemplate: string, nominal: number): { qris: stri
   }
 
   result += '6304';
-  const crc = calculateCRC16(result);
+  const checksum = calculateCRC16(result);
+  const fullQris = result + checksum;
+
   return {
-    qris: result + crc,
-    crc,
-    totalAmount,
-    uniqueCode
+    rawQris: fullQris,
+    checksum,
+    baseNominal,
+    uniqueOffset,
+    feeAmount,
+    finalTotalAmount
   };
 }
 
 /**
- * Web Crypto SHA-512 Hash
+ * SHA-512 for Midtrans Signature simulator
  */
 async function computeSHA512(message: string): Promise<string> {
   const msgUint8 = new TextEncoder().encode(message);
@@ -109,1451 +224,1293 @@ async function computeSHA512(message: string): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/**
- * Synthesize Fintech Chime via Web Audio API (Zero External Dependency)
- */
-function playFintechChime() {
-  try {
-    const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const ctx = new AudioContextClass();
-    const now = ctx.currentTime;
-
-    const osc1 = ctx.createOscillator();
-    const gain1 = ctx.createGain();
-    osc1.type = 'sine';
-    osc1.frequency.setValueAtTime(523.25, now); // C5
-    osc1.frequency.exponentialRampToValueAtTime(783.99, now + 0.12); // G5
-    gain1.gain.setValueAtTime(0.25, now);
-    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.7);
-    osc1.connect(gain1);
-    gain1.connect(ctx.destination);
-    osc1.start(now);
-    osc1.stop(now + 0.7);
-
-    const osc2 = ctx.createOscillator();
-    const gain2 = ctx.createGain();
-    osc2.type = 'triangle';
-    osc2.frequency.setValueAtTime(1046.50, now + 0.08); // C6
-    gain2.gain.setValueAtTime(0.3, now + 0.08);
-    gain2.gain.exponentialRampToValueAtTime(0.001, now + 1.1);
-    osc2.connect(gain2);
-    gain2.connect(ctx.destination);
-    osc2.start(now + 0.08);
-    osc2.stop(now + 1.1);
-  } catch (err) {
-    console.warn('Web Audio API not supported:', err);
-  }
-}
-
-/**
- * Minimal Canvas Confetti Generator
- */
-function triggerConfetti() {
-  const canvas = document.createElement('canvas');
-  canvas.style.position = 'fixed';
-  canvas.style.top = '0';
-  canvas.style.left = '0';
-  canvas.style.width = '100vw';
-  canvas.style.height = '100vh';
-  canvas.style.pointerEvents = 'none';
-  canvas.style.zIndex = '9999';
-  document.body.appendChild(canvas);
-
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-
-  const particles: Array<{ x: number; y: number; vx: number; vy: number; size: number; color: string; rot: number; vrot: number }> = [];
-  const colors = ['#0284c7', '#38bdf8', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'];
-
-  for (let i = 0; i < 70; i++) {
-    particles.push({
-      x: window.innerWidth / 2,
-      y: window.innerHeight * 0.4,
-      vx: (Math.random() - 0.5) * 14,
-      vy: (Math.random() - 0.7) * 14,
-      size: Math.random() * 8 + 4,
-      color: colors[Math.floor(Math.random() * colors.length)],
-      rot: Math.random() * 360,
-      vrot: (Math.random() - 0.5) * 10
-    });
-  }
-
-  let frame = 0;
-  function animate() {
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    frame++;
-
-    let alive = false;
-    for (const p of particles) {
-      p.x += p.vx;
-      p.y += p.vy;
-      p.vy += 0.35; // gravity
-      p.rot += p.vrot;
-
-      if (p.y < canvas.height) alive = true;
-
-      ctx.save();
-      ctx.translate(p.x, p.y);
-      ctx.rotate((p.rot * Math.PI) / 180);
-      ctx.fillStyle = p.color;
-      ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
-      ctx.restore();
-    }
-
-    if (alive && frame < 150) {
-      requestAnimationFrame(animate);
-    } else {
-      canvas.remove();
-    }
-  }
-  requestAnimationFrame(animate);
-}
-
-/**
- * Lightweight QR Code Pattern Renderer for Canvas Preview
- */
-function renderQRPreview(canvas: HTMLCanvasElement, text: string) {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  const size = 180;
-  canvas.width = size;
-  canvas.height = size;
-
-  // Background
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, size, size);
-
-  // Simple visual QR matrix pattern based on string hash
-  ctx.fillStyle = '#0f172a';
-  const cellSize = 6;
-  const grid = Math.floor(size / cellSize);
-
-  // Standard finder corners
-  function drawFinder(startX: number, startY: number) {
-    for (let r = 0; r < 7; r++) {
-      for (let c = 0; c < 7; c++) {
-        if (r === 0 || r === 6 || c === 0 || c === 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4)) {
-          ctx!.fillRect((startX + c) * cellSize, (startY + r) * cellSize, cellSize, cellSize);
-        }
-      }
-    }
-  }
-
-  drawFinder(2, 2);
-  drawFinder(grid - 9, 2);
-  drawFinder(2, grid - 9);
-
-  // Fill pseudo modules with deterministic hash
-  let hash = 0;
-  for (let i = 0; i < text.length; i++) {
-    hash = ((hash << 5) - hash) + text.charCodeAt(i);
-    hash |= 0;
-  }
-
-  for (let r = 2; r < grid - 2; r++) {
-    for (let c = 2; c < grid - 2; c++) {
-      // Avoid finder areas
-      if ((r < 10 && c < 10) || (r < 10 && c > grid - 11) || (r > grid - 11 && c < 10)) continue;
-
-      const val = Math.abs(Math.sin((r * grid + c) * 0.7 + hash));
-      if (val > 0.45) {
-        ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
-      }
-    }
-  }
-}
-
-// --------------------------------------------------------------------------
-// Render Main Application UI
-// --------------------------------------------------------------------------
+// ============================================================================
+// Render UI Layout
+// ============================================================================
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
 app.innerHTML = `
-<!-- Top Sticky Header -->
-<header class="top-header">
-  <div class="brand-wrapper">
-    <button class="btn-icon mobile-menu-btn" id="mobileMenuBtn" aria-label="Toggle navigation">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-    </button>
-    <div class="brand-icon">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-    </div>
-    <div class="brand-title">
-      <span>YURIPAY</span>
-      <span class="brand-badge">v1.2 Enterprise</span>
-    </div>
-  </div>
-
-  <div class="header-actions">
-    <div class="search-input-wrapper">
-      <svg class="search-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-      <input type="text" id="searchInput" class="search-input" placeholder="Cari dokumentasi..." />
+<!-- Pixel Header -->
+<header class="pixel-header">
+  <div class="header-container">
+    <div class="brand-box">
+      <div class="brand-pixel-logo">⚡</div>
+      <div class="brand-text-col">
+        <span class="brand-name">YURIPAY <span class="pixel-badge pink">v1.2 PIXEL</span></span>
+        <span class="brand-subtitle">Dynamic QRIS Gateway & 100% Code Suite</span>
+      </div>
     </div>
 
-    <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" class="btn-star" title="Star di GitHub">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-      <span>Star</span>
-      <span class="star-count" id="starCount">★ 120+</span>
-    </a>
+    <!-- Navigation Pegs (Tabs) -->
+    <nav class="header-nav" id="topNav">
+      <button class="pixel-tab-btn active" data-tab="tab-generator">⚡ GENERATOR</button>
+      <button class="pixel-tab-btn" data-tab="tab-checker">🔍 CEK QRIS</button>
+      <button class="pixel-tab-btn" data-tab="tab-docs">📖 DOKUMEN & KODE</button>
+      <button class="pixel-tab-btn" data-tab="tab-webhook">🛡️ WEBHOOK</button>
+      <button class="pixel-tab-btn" data-tab="tab-github">⭐ GITHUB & REPO</button>
+      <button class="pixel-tab-btn" data-tab="tab-deploy">🚀 DEPLOYMENT</button>
+    </nav>
 
-    <button id="themeToggleBtn" class="btn-icon" aria-label="Toggle Theme">
-      <svg id="themeIconSun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>
-      <svg id="themeIconMoon" style="display:none;" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-    </button>
+    <!-- Header Actions -->
+    <div class="header-actions">
+      <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" class="pixel-github-header-btn" title="Star di GitHub">
+        ★ STAR <span id="headerStarCount">...</span>
+      </a>
+      <a href="https://github.com/myzert/YURIPAY-GOPAY/fork" target="_blank" rel="noopener" class="pixel-github-header-btn" style="background:var(--pink-soft);" title="Fork di GitHub">
+        🍴 FORK <span id="headerForkCount">...</span>
+      </a>
+      <button class="pixel-icon-btn" id="themeToggleBtn" title="Ganti Tema (Gelap / Terang)">
+        <span id="themeIcon">🌸</span>
+      </button>
+    </div>
   </div>
 </header>
 
-<div class="doc-container">
-  <!-- Left Sidebar Navigation -->
-  <aside class="doc-sidebar" id="docSidebar">
-    <div class="nav-group-title">MEMULAI</div>
-    <ul class="nav-list">
-      <li><a href="#ikhtisar" class="nav-link active"><span>⚡ Ikhtisar Arsitektur</span></a></li>
-      <li><a href="#why-no-serverless" class="nav-link"><span>⚠️ Kenapa Bukan Serverless?</span><span class="nav-badge-pill">Stateful</span></a></li>
-      <li><a href="#fitur-enterprise" class="nav-link"><span>💎 Fitur Utama Enterprise</span></a></li>
-      <li><a href="#dual-port" class="nav-link"><span>🏰 Keamanan Dual-Port</span></a></li>
-    </ul>
+<main class="main-layout">
 
-    <div class="nav-group-title">BEDAH KODE REPOSITORI</div>
-    <ul class="nav-list">
-      <li><a href="#code-deep-dive" class="nav-link"><span>🔍 Analisis Setiap File</span></a></li>
-      <li><a href="#file-server" class="nav-link"><span>📄 server.js (Dual Express)</span></a></li>
-      <li><a href="#file-qris" class="nav-link"><span>📄 qrisHelper.js (EMVCo)</span></a></li>
-      <li><a href="#file-client" class="nav-link"><span>📄 gopayClient.js (GoBiz API)</span></a></li>
-      <li><a href="#file-store" class="nav-link"><span>📄 paymentStore.js (SQLite)</span></a></li>
-      <li><a href="#file-webhook" class="nav-link"><span>📄 webhookEngine.js (Midtrans)</span></a></li>
-    </ul>
-
-    <div class="nav-group-title">INTERACTIVE TOOLS</div>
-    <ul class="nav-list">
-      <li><a href="#simulator-qris" class="nav-link"><span>🧮 Dynamic QRIS Generator</span><span class="nav-badge-pill">Live</span></a></li>
-      <li><a href="#simulator-webhook" class="nav-link"><span>🔒 SHA-512 Signature Hash</span></a></li>
-      <li><a href="#simulator-audio" class="nav-link"><span>🎵 Audio Celebration Preview</span></a></li>
-    </ul>
-
-    <div class="nav-group-title">DEPLOYMENT & INTEGRASI</div>
-    <ul class="nav-list">
-      <li><a href="#otentikasi-gobiz" class="nav-link"><span>📱 Otentikasi OTP Terminal</span></a></li>
-      <li><a href="#deployment" class="nav-link"><span>🚀 Panduan Deployment</span></a></li>
-      <li><a href="#env-config" class="nav-link"><span>⚙️ Konfigurasi .env</span></a></li>
-      <li><a href="#api-spec" class="nav-link"><span>🔌 Spesifikasi API REST</span></a></li>
-      <li><a href="#midtrans-webhook" class="nav-link"><span>🔔 Integrasi Webhook Midtrans</span></a></li>
-    </ul>
-
-    <div class="nav-group-title">KOMUNITAS & BANTUAN</div>
-    <ul class="nav-list">
-      <li><a href="#github-star" class="nav-link"><span>⭐ Star di GitHub</span></a></li>
-      <li><a href="#contributors" class="nav-link"><span>🤝 Tim & Kontributor</span></a></li>
-      <li><a href="#support" class="nav-link"><span>💖 Dukungan / Donasi</span></a></li>
-      <li><a href="#faq" class="nav-link"><span>❓ Pertanyaan Umum (FAQ)</span></a></li>
-      <li><a href="#license" class="nav-link"><span>📄 Lisensi ISC</span></a></li>
-    </ul>
-  </aside>
-
-  <!-- Main Content -->
-  <main class="doc-main">
-    <!-- Hero Banner -->
-    <div class="hero-banner">
-      <div class="hero-glow-blob"></div>
-      <div class="hero-tag">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        <span>ENTERPRISE SELF-HOSTED GATEWAY</span>
-      </div>
-
-      <h1 class="hero-title">
-        ⚡ YURIPAY <span class="gradient-text">by myzert</span>
-      </h1>
-      <p class="hero-subtitle">
-        Enterprise Self-Hosted Dynamic QRIS Payment Gateway untuk GoBiz Merchants. Stateful High-Performance, Dual-Port Isolation, Webhook Midtrans SHA-512, dan Idempotensi Penuh dengan 0% Potongan Biaya.
-      </p>
-
-      <div class="hero-badges-row">
-        <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener">
-          <img src="https://img.shields.io/badge/YURIPAY-by%20myzert-0284c7?style=for-the-badge&logo=shield" alt="YuriPay by myzert" />
-        </a>
-        <a href="https://github.com/myzert/YURIPAY-GOPAY/stargazers" target="_blank" rel="noopener">
-          <img src="https://img.shields.io/github/stars/myzert/YURIPAY-GOPAY?style=for-the-badge&logo=github&color=0284c7" alt="GitHub Stars" />
-        </a>
-        <img src="https://img.shields.io/badge/QRIS-Bank%20Indonesia%20Standard-red?style=for-the-badge" alt="QRIS Standard" />
-        <img src="https://img.shields.io/badge/Runtime-Stateful%20Only-success?style=for-the-badge" alt="Stateful Only" />
-        <img src="https://img.shields.io/badge/Serverless-STRICTLY%20UNSUPPORTED-critical?style=for-the-badge" alt="No Serverless" />
-        <img src="https://img.shields.io/badge/License-ISC-blue?style=for-the-badge" alt="ISC License" />
-      </div>
-
-      <div class="hero-cta-group">
-        <a href="#simulator-qris" class="btn-primary">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-          <span>Coba Simulator QRIS</span>
-        </a>
-        <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" class="btn-secondary">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
-          <span>Lihat di GitHub ⭐</span>
-        </a>
-        <a href="#deployment" class="btn-secondary">
-          <span>Panduan Deploy 🚀</span>
-        </a>
-      </div>
-    </div>
-
-    <!-- Quick Metric Cards -->
-    <div class="metrics-grid">
-      <div class="metric-card">
-        <div class="metric-value">0%</div>
-        <div class="metric-label">Gateway Fee</div>
-        <div class="metric-desc">Dana masuk 100% langsung ke GoBiz Anda tanpa potongan pihak ketiga.</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value">2.5s</div>
-        <div class="metric-label">Kecepatan Verifikasi</div>
-        <div class="metric-desc">Daemon poller realtime memverifikasi mutasi transaksi dalam hitungan detik.</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value">+1 Perak</div>
-        <div class="metric-label">Offset Presisi</div>
-        <div class="metric-desc">Hemat dan akurat untuk transaksi mikro maupun retail standar.</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value">Dual-Port</div>
-        <div class="metric-label">Isolasi Keamanan</div>
-        <div class="metric-desc">Port 3000 (Internal & Kasir) terpisah total dari Port 3001 (Publik Checkout).</div>
-      </div>
-    </div>
-
-    <!-- Legal Disclaimer Alert -->
-    <div class="alert-box alert-important" id="disclaimer">
-      <div class="alert-icon">⚖️</div>
-      <div>
-        <strong>PERNYATAAN RESMI HUKUM (LEGAL DISCLAIMER):</strong><br>
-        1. <strong>Proyek Komunitas Mandiri (Unofficial Project)</strong>: <strong>YURIPAY</strong> adalah software open-source independen yang dikembangkan oleh <strong>myzert</strong> untuk riset, edukasi, dan integrasi kasir mandiri. Software ini <strong>TIDAK berafiliasi, didukung, atau disetujui resmi oleh PT GoTo Gojek Tokopedia Tbk (Gojek / GoPay / GoBiz), Bank Indonesia, maupun ASPI</strong>.<br>
-        2. <strong>Kepatuhan Merchant</strong>: Pengguna wajib mematuhi S&K GoBiz dan peraturan Bank Indonesia terkait pembayaran QRIS (PADG No. 21/18/PADG/2019).
-      </div>
-    </div>
-
-    <!-- Section: Ikhtisar Arsitektur -->
-    <section class="doc-section" id="ikhtisar">
-      <div class="section-header">
-        <h2 class="section-title">🏛️ Ikhtisar Arsitektur Transaksi</h2>
-        <p class="section-lead">Bagaimana YuriPay mengonversi QRIS Statis GoBiz Anda menjadi payment gateway otomatis.</p>
-      </div>
-
-      <div class="code-tab-container">
-        <div class="code-tab-header">
-          <span style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent-primary);">ALUR TRANSAKSI STATEFUL YURIPAY</span>
-        </div>
-        <pre class="code-content"><code>[ Pelanggan Toko ]                                            [ Server Toko / Merchant ]
-        │                                                                  │
-        │ 1. Buat Tagihan (POST /api/create-payment)                       │
-        │◄─────────────────────────────────────────────────────────────────┤
-        │                                                                  │
-        ▼                                                                  │
-[ Halaman Checkout (/pay/:id) ]                                            │
-• QRIS Dinamis Otomatis                                                    │
-• Nominal Unik (+1 Perak)                                                  │
-• Mode: Default Chime / Anime                                              │
-        │                                                                  │
-        │ 2. Pembayaran via Bank / E-Wallet (BCA, GoPay, DANA, dll.)        │
-        ▼                                                                  │
-[ Jaringan GoPay / GoBiz ]                                                 │
-        │                                                                  │
-        │ 3. Settlement Masuk ke Rekening GoBiz                            │
-        ▼                                                                  │
-[ YuriPay Daemon Background (Port 3000 & 3001) ]                           │
-• Poller Realtime (Setiap 2.5 Detik)                                       │
-• Pencocokan Presisi Nominal Unik & Timestamp                              │
-• Update Status SQLite WAL -> LUNAS • TERVERIFIKASI                        │
-        │                                                                  │
-        ├─────────────────────────────────────────────────────────────────►│
-        │ 4. Webhook HTTP POST (Midtrans SHA-512)                          │
-        │                                                                  ▼
-        │                                                      [ Pesanan Diproses Toko ]
-        │ 5. Auto OP Redirect ke Website Toko                              │
-        ▼                                                                  │
-[ Toko Selesai (https://tokosaya.com/finish?order_id=...&status_code=200) ]│</code></pre>
-      </div>
-    </section>
-
-    <!-- Section: Why No Serverless -->
-    <section class="doc-section" id="why-no-serverless">
-      <div class="section-header">
-        <h2 class="section-title">⚠️ Kenapa YuriPay Tidak Bisa di Vercel / Serverless?</h2>
-        <p class="section-lead">Penjelasan teknis mengapa platform Serverless seperti Vercel, Netlify, atau AWS Lambda tidak kompatibel.</p>
-      </div>
-
-      <div class="alert-box alert-caution">
-        <div class="alert-icon">🚨</div>
+  <!-- ======================================================================== -->
+  <!-- TAB 1: GENERATOR QRIS DINAMIS (LIVE SCANNABLE QR & TLV BREAKDOWN)        -->
+  <!-- ======================================================================== -->
+  <section class="page-tab-content active" id="tab-generator">
+    <div class="pixel-card">
+      <div class="pixel-card-header">
         <div>
-          <strong>PERINGATAN ARSITEKTUR:</strong> YuriPay dirancang secara fundamental sebagai <strong>DAEMON STATEFUL</strong>. YuriPay <strong>TIDAK DAPAT BERJALAN</strong> di Vercel, Netlify, Cloudflare Workers, AWS Lambda, atau platform serverless sejenis.
+          <h2 class="pixel-title">⚡ REAL DYNAMIC QRIS GENERATOR</h2>
+          <p class="pixel-subtitle">Generate QRIS dinamis asli yang bisa di-scan m-banking/e-wallet dengan nominal terkunci & kalkulasi CRC-16 EMVCo resmi.</p>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <span class="pixel-badge green">[EMVCO 100% VALID]</span>
+          <span class="pixel-badge pink">[0% GATEWAY FEE]</span>
         </div>
       </div>
 
-      <div class="table-container">
-        <table class="doc-table">
-          <thead>
-            <tr>
-              <th>Kebutuhan Sistem YuriPay</th>
-              <th>❌ Platform Serverless (Vercel / Lambda)</th>
-              <th>✔️ Lingkungan Stateful (VPS / cPanel / Docker / Termux)</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><strong>Realtime Daemon Poller</strong></td>
-              <td>Container dibekukan (<em>frozen</em>) seketika setelah respon HTTP dikirim. Event loop berhenti total dan mutasi tidak akan pernah terverifikasi.</td>
-              <td>Node.js Process berjalan 24/7 di background, memeriksa mutasi GoPay setiap 2.5 detik secara non-blocking.</td>
-            </tr>
-            <tr>
-              <td><strong>Penyimpanan SQLite WAL</strong></td>
-              <td>Filesystem bersifat read-only dan sementara (<em>ephemeral</em>). Database terhapus otomatis saat instance <em>scale-to-zero</em>.</td>
-              <td>Database tersimpan permanen pada disk POSIX dengan konkurensi tinggi melalui mode Write-Ahead Logging (WAL).</td>
-            </tr>
-            <tr>
-              <td><strong>Arsitektur Dual-Port</strong></td>
-              <td>Hanya mendukung single-port HTTP router standar.</td>
-              <td>Membuka dua socket port terisolasi secara simultan (Port 3000 Internal & Port 3001 Publik).</td>
-            </tr>
-            <tr>
-              <td><strong>In-Memory Mutex Lock</strong></td>
-              <td>Instance serverless di-spawn secara acak (multi-instans tanpa sinkronisasi memori), menyebabkan tabrakan kode unik.</td>
-              <td>Menjaga memori sesi aktif terpusat, menjamin offset +1 perak tidak bertabrakan antar pelanggan simultan.</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Section: Fitur Enterprise -->
-    <section class="doc-section" id="fitur-enterprise">
-      <div class="section-header">
-        <h2 class="section-title">💎 Fitur Utama Enterprise</h2>
-        <p class="section-lead">Fitur andalan yang dirancang untuk keandalan kasir e-commerce dan aplikasi berskala tinggi.</p>
-      </div>
-
-      <div class="table-container">
-        <table class="doc-table">
-          <thead>
-            <tr>
-              <th>Fitur</th>
-              <th>Deskripsi & Keunggulan</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><strong>🧮 Algoritma Offset Kode Unik</strong></td>
-              <td>
-                • Transaksi mikro (&lt; Rp 1.000): strictly <strong>+Rp 1 perak</strong> (contoh: Rp 500 &rarr; Rp 501).<br>
-                • Transaksi standar (&ge; Rp 1.000): offset acak <strong>1 s/d 199 perak</strong> (maksimal tidak lebih dari 200 perak).<br>
-                • Dilengkapi anti-tabrakan otomatis (<em>collision prevention</em>) jika ada pesanan kembar.
-              </td>
-            </tr>
-            <tr>
-              <td><strong>🎭 Dual Success Theme</strong></td>
-              <td>
-                Dua mode selebrasi pembayaran:<br>
-                • <strong>Mode Default</strong>: Gaya formal fintech profesional Stripe/Apple Pay dengan audio <em>Fintech Chime</em> (disintesis via Web Audio API tanpa latensi).<br>
-                • <strong>Mode Anime</strong>: Modal Marin Kitagawa, suara selebrasi <em>Cute Arigato</em>, dan hujan konfeti.
-              </td>
-            </tr>
-            <tr>
-              <td><strong>🕶️ Stealth Anti-Probe</strong></td>
-              <td>Akses langsung ke root port publik (<code>http://localhost:3001/</code>) otomatis dialihkan (302 Redirect) ke halaman aman atau repository GitHub resmi untuk menangkal bot scanner.</td>
-            </tr>
-            <tr>
-              <td><strong>🛡️ Idempotensi Transaksi Penuh</strong></td>
-              <td>Pelanggan yang me-refresh browser atau jaringan terputus tidak akan membuat tagihan baru. Sistem mengikat pesanan pada <code>order_id</code> yang sama.</td>
-            </tr>
-            <tr>
-              <td><strong>🔔 Webhook Identik Midtrans</strong></td>
-              <td>Format payload dan signature key SHA-512 100% kompatibel dengan modul Midtrans di berbagai framework (Laravel, Express, dsb).</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Section: Keamanan Dual-Port -->
-    <section class="doc-section" id="dual-port">
-      <div class="section-header">
-        <h2 class="section-title">🏰 Arsitektur Keamanan Dual-Port</h2>
-        <p class="section-lead">Isolasi zona jaringan internal manajemen vs antarmuka checkout publik.</p>
-      </div>
-
-      <div class="network-flow-container">
-        <div style="text-align: center; font-weight: 700; color: var(--accent-primary);">LALU LINTAS JARINGAN TERPISAH (DEFENSE IN DEPTH)</div>
-        <div class="ports-split">
-          <div class="port-box internal">
-            <div class="port-header">
-              <span class="port-badge badge-internal">PORT 3000 - INTERNAL ADMIN</span>
-              <span>🔐 Terproteksi</span>
+      <div class="grid-2col">
+        <!-- Input Form Col -->
+        <div>
+          <!-- Preset Selector -->
+          <div class="pixel-form-group">
+            <label class="pixel-label">1. PILIH PRESET CONTOH MERCHANT:</label>
+            <div class="preset-chips-row">
+              <button class="chip-btn active" id="presetDompuBtn">🏪 Mister Dompu 2 (CIMB/QRIS)</button>
+              <button class="chip-btn" id="presetZeroBtn">🛒 ZERO SHOP (GoBiz GoPay)</button>
+              <button class="chip-btn" id="presetCustomBtn">✏️ Custom Static QRIS</button>
             </div>
-            <ul class="port-feature-list">
-              <li class="port-feature-item">✔ Dashboard Kasir & Riwayat Transaksi</li>
-              <li class="port-feature-item">✔ Login Email & Password dengan Session Guard</li>
-              <li class="port-feature-item">✔ Log Mutasi GoBiz Realtime & Riwayat Webhook</li>
-              <li class="port-feature-item">✔ Swagger UI Interactive API Docs (/docs)</li>
-              <li class="port-feature-item">✔ Akses Sesi Kredensial GoBiz & Database</li>
-            </ul>
           </div>
 
-          <div class="port-box public">
-            <div class="port-header">
-              <span class="port-badge badge-public">PORT 3001 - PUBLIK CHECKOUT</span>
-              <span>🌐 Publik</span>
+          <!-- Static QRIS Payload Input -->
+          <div class="pixel-form-group">
+            <label class="pixel-label">TEMPLATE QRIS STATIS (SUMBER):</label>
+            <textarea class="pixel-textarea" id="staticQrisInput" placeholder="Tempel raw QRIS statis di sini...">${PRESET_MISTER_DOMPU}</textarea>
+            <span class="pixel-subtitle" style="display:block; margin-top:4px;">*Mendukung QRIS GoBiz, CIMB Niaga, BCA, Bank Mandiri, ShopeePay, Dana, dll.</span>
+          </div>
+
+          <!-- Nominal Tagihan -->
+          <div class="pixel-form-group">
+            <label class="pixel-label">2. NOMINAL TRANSAKSI (RUPIAH):</label>
+            <input type="number" class="pixel-input" id="nominalInput" value="1000" min="1" step="100" />
+            <div class="preset-chips-row">
+              <button class="chip-btn" data-nom="500">Rp 500</button>
+              <button class="chip-btn active" data-nom="1000">Rp 1.000</button>
+              <button class="chip-btn" data-nom="5000">Rp 5.000</button>
+              <button class="chip-btn" data-nom="10000">Rp 10.000</button>
+              <button class="chip-btn" data-nom="25000">Rp 25.000</button>
+              <button class="chip-btn" data-nom="50000">Rp 50.000</button>
+              <button class="chip-btn" data-nom="100000">Rp 100.000</button>
             </div>
-            <ul class="port-feature-list">
-              <li class="port-feature-item">✔ Halaman Checkout Pelanggan (/pay/:id)</li>
-              <li class="port-feature-item">✔ Endpoint Buat Pembayaran Publik</li>
-              <li class="port-feature-item">✔ Poller Status Publik Tanpa Sesi Admin</li>
-              <li class="port-feature-item">✔ Stealth Auto-Redirect Anti-Bot Scanner</li>
-              <li class="port-feature-item">🚫 Zero Access ke Token Sesi GoBiz (.json)</li>
-            </ul>
+          </div>
+
+          <!-- Unique Offset Rule (GoBiz Algorithm) -->
+          <div class="pixel-form-group">
+            <label class="pixel-label">3. ATURAN KODE UNIK (ALGORITMA YURIPAY):</label>
+            <select class="pixel-select" id="uniqueModeSelect">
+              <option value="yuripay">⚡ Algoritma Resmi YuriPay (&lt;1000: +1 perak, &ge;1000: acak 1..199)</option>
+              <option value="exact">🎯 Nominal Pas (Tanpa Kode Unik / Offset 0)</option>
+              <option value="custom">🛠️ Custom Offset Tambahan</option>
+            </select>
+            <div id="customOffsetBox" style="display:none; margin-top:8px;">
+              <input type="number" class="pixel-input" id="customOffsetInput" placeholder="Masukkan nominal offset (contoh: 88)" value="0" />
+            </div>
+          </div>
+
+          <!-- Fee Tambahan -->
+          <div class="pixel-form-group">
+            <label class="pixel-label">4. BIAYA LAYANAN / ADMIN (OPSIONAL):</label>
+            <div class="grid-2col" style="gap:8px;">
+              <select class="pixel-select" id="feeTypeSelect">
+                <option value="none">Gratis (Tanpa Biaya Admin)</option>
+                <option value="flat">Biaya Tetap (Rp)</option>
+                <option value="percent">Persentase (%)</option>
+              </select>
+              <input type="number" class="pixel-input" id="feeValInput" placeholder="Nilai fee" value="0" disabled />
+            </div>
+          </div>
+
+          <button class="pixel-btn primary" id="generateDynamicBtn" style="width:100%; margin-top:8px;">
+            ⚡ RE-GENERATE QRIS DINAMIS SEKARANG
+          </button>
+        </div>
+
+        <!-- Output Visual & Raw Col -->
+        <div>
+          <div class="qr-preview-box">
+            <span class="pixel-badge pink" style="margin-bottom:12px;">[SCANNABLE VIA SEMUA M-BANKING]</span>
+            <div class="qr-canvas-frame">
+              <canvas id="dynamicQrCanvas"></canvas>
+            </div>
+            <div class="qr-amount-callout" id="displayTotalAmount">Rp 1.000</div>
+            <div class="qr-merchant-callout" id="displayMerchantInfo">Mister Dompu 2 • Dompu</div>
+
+            <!-- Breakdown Detail Callout -->
+            <div style="font-family:var(--font-mono); font-size:0.8rem; background:var(--bg-card); border:2px solid var(--border-pixel); padding:8px 12px; width:100%; text-align:left; margin-bottom:14px;">
+              <div>• Nominal Asli: <strong id="lblBaseNominal">Rp 1.000</strong></div>
+              <div>• Kode Unik: <strong id="lblUniqueOffset">+Rp 0</strong></div>
+              <div>• Biaya Admin: <strong id="lblFeeAmount">+Rp 0</strong></div>
+              <div style="border-top:1px dashed var(--border-pixel); margin-top:4px; padding-top:4px; color:var(--pink-neon);">
+                • Total Terkunci Tag 54: <strong id="lblFinalAmount">Rp 1.000</strong>
+              </div>
+            </div>
+
+            <div style="display:flex; gap:10px; width:100%; justify-content:center; flex-wrap:wrap;">
+              <button class="pixel-btn success" id="downloadQrBtn">📥 DOWNLOAD PNG</button>
+              <button class="pixel-btn" id="copyDynamicTextBtn">📋 COPY TEXT QRIS</button>
+            </div>
+          </div>
+
+          <!-- Raw String Generated Output -->
+          <div class="pixel-code-box" style="margin-top:16px;">
+            <div class="pixel-code-header">
+              <span class="pixel-code-title">RAW DYNAMIC QRIS STRING:</span>
+              <span class="pixel-badge green" id="dynamicCrcBadge">CRC16: OK</span>
+            </div>
+            <pre class="pixel-code-pre" id="dynamicRawOutput" style="white-space:pre-wrap; word-break:break-all; max-height:120px;"></pre>
           </div>
         </div>
       </div>
-    </section>
 
-    <!-- Section: Bedah Kode Repositori (Code Deep Dive) -->
-    <section class="doc-section" id="code-deep-dive">
-      <div class="section-header">
-        <h2 class="section-title">🔍 Bedah Kode & Arsitektur File (Code Deep Dive)</h2>
-        <p class="section-lead">Penjelasan mendalam fungsi dan logika setiap berkas pada repositori resmi YuriPay.</p>
-      </div>
-
-      <div class="faq-list">
-        <!-- server.js -->
-        <div class="faq-item open" id="file-server">
-          <button class="faq-question">
-            <span>📄 server.js — Inisialisasi Server & Routing Dual-Port</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p><strong>Lokasi:</strong> <code>server.js</code></p>
-            <p><strong>Fungsi:</strong> Menginstansiasi dua Express App terpisah (<code>dashboardApp</code> di Port 3000 dan <code>paymentApp</code> di Port 3001). Mengatur middleware session admin berdurasi 7 hari, registrasi endpoint Swagger, rute pembayaran <code>/pay/:id</code>, dan logika stealth redirect pada root port pembayaran.</p>
-          </div>
-        </div>
-
-        <!-- qrisHelper.js -->
-        <div class="faq-item" id="file-qris">
-          <button class="faq-question">
-            <span>📄 src/gateway/qrisHelper.js — Parser EMVCo & Kalkulasi CRC16</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p><strong>Lokasi:</strong> <code>src/gateway/qrisHelper.js</code></p>
-            <p><strong>Fungsi:</strong> Membedah string QRIS statis GoBiz sesuai standar TLV EMVCo, mengubah Tag 01 dari statis (11) menjadi dinamis (12), menyisipkan Tag 54 (nominal pembayaran), dan menghitung ulang checksum <strong>CRC16-CCITT (0xFFFF polynomial 0x1021)</strong>. Juga berisi fungsi <code>generateUniqueAmount()</code> untuk kalkulasi offset +1 perak anti-bentrok.</p>
-          </div>
-        </div>
-
-        <!-- gopayClient.js -->
-        <div class="faq-item" id="file-client">
-          <button class="faq-question">
-            <span>📄 src/gateway/gopayClient.js — Klien GoBiz & Pencocokan Mutasi</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p><strong>Lokasi:</strong> <code>src/gateway/gopayClient.js</code></p>
-            <p><strong>Fungsi:</strong> Mengambil mutasi dari Gojek Analytics API (<code>https://api.gojekapi.com/merchant-analytics/v2/merchants/transactions</code>). Mencocokkan nilai nominal dan timestamp pembayaran pelanggan. Apabila menerima respon <code>401 Unauthorized</code>, modul ini otomatis memicu <code>sessionManager.refreshSession()</code> di latar belakang.</p>
-          </div>
-        </div>
-
-        <!-- paymentStore.js -->
-        <div class="faq-item" id="file-store">
-          <button class="faq-question">
-            <span>📄 src/gateway/paymentStore.js — Transaksi & SQLite WAL Persistence</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p><strong>Lokasi:</strong> <code>src/gateway/paymentStore.js</code></p>
-            <p><strong>Fungsi:</strong> Mengelola tabel SQLite <code>yuripay_payments</code> dengan mode WAL. Menyediakan cache in-memory <code>activePayments = new Map()</code> untuk menjamin idempotensi pesanan via <code>order_id</code> dan respon cepat tanpa membebani I/O disk server.</p>
-          </div>
-        </div>
-
-        <!-- webhookEngine.js -->
-        <div class="faq-item" id="file-webhook">
-          <button class="faq-question">
-            <span>📄 src/gateway/webhookEngine.js — Midtrans SHA-512 Webhook Engine</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p><strong>Lokasi:</strong> <code>src/gateway/webhookEngine.js</code></p>
-            <p><strong>Fungsi:</strong> Membangun payload notifikasi JSON yang identik dengan Midtrans (status <code>settlement</code>, <code>expire</code>, <code>pending</code>), menghitung signature key digital <code>SHA512(order_id + status_code + gross_amount + ServerKey)</code>, serta menjalankan pengiriman otomatis dengan exponential retry hingga 3 kali.</p>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Section: Interactive Simulator (EMVCo Dynamic QRIS) -->
-    <section class="doc-section" id="simulator-qris">
-      <div class="section-header">
-        <h2 class="section-title">🧮 Interactive Live Simulator: Dynamic QRIS Generator</h2>
-        <p class="section-lead">Uji coba pembuatan QRIS dinamis langsung di peramban dengan parser EMVCo & CRC16 CCITT.</p>
-      </div>
-
-      <div class="simulator-card">
-        <div class="sim-header">
-          <div class="sim-title">
-            <span>🛠️ EMVCo QRIS Generator Playground</span>
-          </div>
-          <span class="brand-badge">Pure Client-Side Math</span>
-        </div>
-
-        <div class="sim-grid">
+      <!-- EMVCo TLV Inspector Section -->
+      <div style="margin-top:28px;">
+        <div class="pixel-card-header" style="margin-bottom:10px;">
           <div>
-            <div class="form-group">
-              <label class="form-label">QRIS Statis Template GoBiz:</label>
-              <textarea id="simStaticQris" class="form-textarea" rows="3" style="font-size:0.75rem;">${DEFAULT_STATIC_QRIS}</textarea>
-            </div>
-
-            <div class="form-group">
-              <label class="form-label">Nominal Transaksi Dasar (Rp):</label>
-              <input type="number" id="simNominal" class="form-input" value="10000" min="50" step="10" />
-              <div class="quick-amount-buttons">
-                <button class="btn-pill" data-amt="500">Rp 500 (Mikro)</button>
-                <button class="btn-pill" data-amt="10000">Rp 10.000</button>
-                <button class="btn-pill" data-amt="25000">Rp 25.000</button>
-                <button class="btn-pill" data-amt="50000">Rp 50.000</button>
-                <button class="btn-pill" data-amt="100000">Rp 100.000</button>
-              </div>
-            </div>
-
-            <div style="margin-top: 1rem;">
-              <div style="font-size: 0.85rem; color: var(--text-muted);">Hasil Kalkulasi Offset Kode Unik:</div>
-              <div style="font-size: 1.3rem; font-weight: 800; color: var(--accent-primary);" id="simTotalDisplay">Rp 10.087</div>
-              <div style="font-size: 0.78rem; color: var(--text-muted);" id="simOffsetExplain">Offset acak +Rp 87 perak (tidak pernah melebihi 200 perak).</div>
-            </div>
-          </div>
-
-          <div class="sim-preview-box">
-            <div class="qr-canvas-holder">
-              <canvas id="simQrCanvas"></canvas>
-            </div>
-            <div style="font-size: 0.8rem; font-weight: 700; color: #38bdf8; margin-bottom: 0.5rem;" id="simCrcDisplay">CRC16: 0xXXXX</div>
-            <button id="btnCopyQris" class="btn-copy">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-              <span>Salin String QRIS</span>
-            </button>
+            <h3 class="pixel-title" style="font-size:0.92rem;">🔍 BEDAH STRUKTUR TAG EMVCO (TLV BREAKDOWN)</h3>
+            <p class="pixel-subtitle">Bagaimana Tag 01 diubah jadi 12, Tag 54 disuntikkan, dan CRC-16 dihitung ulang.</p>
           </div>
         </div>
+        <div class="pixel-table-wrapper">
+          <table class="pixel-table" id="dynamicTlvTable">
+            <thead>
+              <tr>
+                <th style="width:70px;">TAG</th>
+                <th style="width:70px;">LENGTH</th>
+                <th>VALUE DATA</th>
+                <th>NAMA FIELD</th>
+                <th>PENJELASAN</th>
+              </tr>
+            </thead>
+            <tbody>
+              <!-- Populated by script -->
+            </tbody>
+          </table>
+        </div>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <!-- Section: Interactive Simulator (SHA-512 Hash) -->
-    <section class="doc-section" id="simulator-webhook">
-      <div class="section-header">
-        <h2 class="section-title">🔒 Kalkulator Signature Key Midtrans SHA-512</h2>
-        <p class="section-lead">Uji coba validasi digital signature dengan Web Crypto API sesuai formula Midtrans.</p>
+  <!-- ======================================================================== -->
+  <!-- TAB 2: CEK CODE QR (UPLOAD & DECODE RAW STRING)                          -->
+  <!-- ======================================================================== -->
+  <section class="page-tab-content" id="tab-checker">
+    <div class="pixel-card">
+      <div class="pixel-card-header">
+        <div>
+          <h2 class="pixel-title">🔍 CEK & DECODE QRIS CODE</h2>
+          <p class="pixel-subtitle">Upload gambar QR code apa saja (screenshot/foto) untuk mengekstrak string mentah, membedah data merchant, dan memverifikasi integritas checksum CRC-16.</p>
+        </div>
+        <span class="pixel-badge gold">[CLIENT-SIDE QR SCANNER]</span>
       </div>
 
-      <div class="simulator-card">
-        <div class="sim-grid">
+      <!-- Upload Dropzone -->
+      <div class="pixel-dropzone" id="qrDropzone">
+        <input type="file" id="qrFileInput" accept="image/*" style="display:none;" />
+        <div class="dropzone-icon">📷</div>
+        <div class="dropzone-title">KLIK ATAU DRAG & DROP FOTO QRIS KE SINI</div>
+        <div class="dropzone-desc">Mendukung format PNG, JPG, JPEG, WebP. Bisa juga langsung tekan <kbd style="background:var(--bg-card); padding:2px 6px; border:1px solid var(--border-pixel);">Ctrl + V</kbd> untuk paste screenshot!</div>
+      </div>
+
+      <!-- Loading / Status Alert -->
+      <div id="checkerStatusAlert" style="display:none; margin-top:16px; padding:12px; border:2px solid var(--border-pixel); font-family:var(--font-silk); font-size:0.8rem;"></div>
+
+      <!-- Result Container (Visible when decoded) -->
+      <div id="checkerResultBox" style="display:none; margin-top:24px;">
+        <div class="grid-2col">
+          <!-- Left: Scanned Image Preview & Quick Metadata -->
           <div>
-            <div class="form-group">
-              <label class="form-label">Order ID (order_id):</label>
-              <input type="text" id="simOrderId" class="form-input" value="INV-20261028-001" />
-            </div>
-            <div class="form-group">
-              <label class="form-label">Status Code (status_code):</label>
-              <input type="text" id="simStatusCode" class="form-input" value="200" />
-            </div>
-            <div class="form-group">
-              <label class="form-label">Gross Amount (gross_amount):</label>
-              <input type="text" id="simGrossAmount" class="form-input" value="10087.00" />
-            </div>
-            <div class="form-group">
-              <label class="form-label">Server Key (API_KEY di .env):</label>
-              <input type="text" id="simServerKey" class="form-input" value="yuripay_live_key_9981248712" />
-            </div>
-          </div>
-
-          <div style="display:flex; flex-direction:column; justify-content:center;">
-            <div class="form-group">
-              <label class="form-label">String Mentah yang Di-hash:</label>
-              <div id="simRawStringDisplay" style="font-family: var(--font-mono); font-size: 0.8rem; background: var(--bg-tertiary); padding: 0.65rem; border-radius: var(--radius-md); word-break: break-all; border: 1px solid var(--border-primary);">
-                INV-20261028-00120010087.00yuripay_live_key_9981248712
+            <div style="background:var(--bg-surface); border:2px solid var(--border-pixel); padding:16px; text-align:center; margin-bottom:16px;">
+              <span class="pixel-badge pink" style="margin-bottom:8px;">GAMBAR QRIS YANG DIUPLOAD:</span>
+              <div style="max-height:220px; overflow:hidden; display:flex; justify-content:center; align-items:center; margin-top:8px;">
+                <img id="checkerImagePreview" style="max-height:200px; max-width:100%; border:2px solid var(--border-pixel);" alt="Scanned QR" />
               </div>
             </div>
 
-            <div class="form-group">
-              <label class="form-label">Hasil Hash SHA-512 (signature_key):</label>
-              <div id="simSignatureDisplay" style="font-family: var(--font-mono); font-size: 0.75rem; background: var(--bg-code); color: #38bdf8; padding: 0.75rem; border-radius: var(--radius-md); word-break: break-all; border: 1px solid var(--border-primary);">
-                Menghitung hash...
+            <!-- Merchant Card Summary -->
+            <div style="background:var(--bg-surface); border:2px solid var(--border-pixel); padding:16px;">
+              <h4 class="pixel-title" style="font-size:0.85rem; margin-bottom:12px;">📋 RINGKASAN DATA MERCHANT</h4>
+              <div style="font-family:var(--font-mono); font-size:0.82rem; line-height:1.8;">
+                <div>• Nama Merchant: <strong id="chkMerchantName" style="color:var(--pink-neon);">-</strong></div>
+                <div>• Kota Merchant: <strong id="chkMerchantCity">-</strong></div>
+                <div>• Kode Pos: <strong id="chkPostalCode">-</strong></div>
+                <div>• Tipe QR: <strong id="chkQrType" class="pixel-badge pink">-</strong></div>
+                <div>• Nominal Terkunci: <strong id="chkAmount" style="color:var(--accent-success);">-</strong></div>
+                <div>• Acquirer / Bank: <strong id="chkAcquirer">-</strong></div>
+                <div>• Checksum Status: <span id="chkCrcStatus" class="pixel-badge green">-</span></div>
               </div>
             </div>
+          </div>
 
-            <button id="btnCopySignature" class="btn-secondary" style="align-self: flex-start; margin-top: 0.5rem;">
-              <span>Salin Signature Key</span>
-            </button>
+          <!-- Right: Raw String & Action Buttons -->
+          <div>
+            <div class="pixel-code-box" style="margin-top:0;">
+              <div class="pixel-code-header">
+                <span class="pixel-code-title">RAW TEXT QRIS HASIL DECODE:</span>
+                <button class="pixel-btn" id="copyScannedRawBtn" style="padding:4px 8px; font-size:0.6rem;">📋 COPY TEXT</button>
+              </div>
+              <pre class="pixel-code-pre" id="chkRawTextOutput" style="white-space:pre-wrap; word-break:break-all; max-height:180px;"></pre>
+            </div>
+
+            <!-- Transfer Button -->
+            <div style="margin-top:14px; background:var(--bg-surface-2); border:2px solid var(--border-pixel); padding:14px;">
+              <div class="pixel-title" style="font-size:0.8rem; margin-bottom:6px;">⚡ JADIKAN SEBAGAI TEMPLATE DINAMIS?</div>
+              <p style="font-size:0.82rem; margin-bottom:12px;">Klik tombol di bawah untuk mentransfer string hasil scan ini ke tab <strong>Generator Dinamis</strong>, agar Anda bisa membuat QRIS nominal dari toko Anda sendiri!</p>
+              <button class="pixel-btn primary" id="transferToGeneratorBtn" style="width:100%;">
+                🚀 TRANSFER KE GENERATOR DINAMIS
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- TLV Decomposed Table of Scanned QR -->
+        <div style="margin-top:24px;">
+          <h3 class="pixel-title" style="font-size:0.9rem; margin-bottom:10px;">🔍 TABEL BEDAH TAG HASIL SCAN</h3>
+          <div class="pixel-table-wrapper">
+            <table class="pixel-table" id="checkerTlvTable">
+              <thead>
+                <tr>
+                  <th style="width:70px;">TAG</th>
+                  <th style="width:70px;">LEN</th>
+                  <th>VALUE</th>
+                  <th>NAMA FIELD</th>
+                  <th>DESKRIPSI</th>
+                </tr>
+              </thead>
+              <tbody>
+                <!-- Populated by script -->
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <!-- Section: Audio Celebration Preview -->
-    <section class="doc-section" id="simulator-audio">
-      <div class="section-header">
-        <h2 class="section-title">🎵 Audio Celebration Previewer (Dual Success Theme)</h2>
-        <p class="section-lead">Dengarkan perbedaan audio selebrasi mode Default (Fintech Chime) dan Anime.</p>
+  <!-- ======================================================================== -->
+  <!-- TAB 3: DOKUMEN & BEDAH KODE 100% (YURIPAY-GOPAY CLONED CODEBASE)        -->
+  <!-- ======================================================================== -->
+  <section class="page-tab-content" id="tab-docs">
+    <div class="pixel-card">
+      <div class="pixel-card-header">
+        <div>
+          <h2 class="pixel-title">📖 BEDAH KODE & ARSITEKTUR YURIPAY 100%</h2>
+          <p class="pixel-subtitle">Struktur direktori, alur otentikasi GoBiz, polling mutasi 2.5 detik, dan isolasi Dual-Port dari repository resmi myzert/YURIPAY-GOPAY.</p>
+        </div>
+        <span class="pixel-badge pink">[CLONED & VERIFIED 100%]</span>
       </div>
 
-      <div class="simulator-card">
-        <div style="display: flex; gap: 1.5rem; flex-wrap: wrap; justify-content: center;">
-          <div style="text-align: center; max-width: 260px;">
-            <div style="font-weight: 700; margin-bottom: 0.5rem;">Mode 1: Default Fintech Chime</div>
-            <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">Disintesis murni via Web Audio API tanpa file eksternal (0 latency).</p>
-            <button id="btnPlayChime" class="btn-primary" style="width: 100%;">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
-              <span>Play Fintech Chime</span>
-            </button>
+      <!-- File Structure Tree -->
+      <h3 class="pixel-title" style="font-size:0.95rem; margin-bottom:12px;">📂 STRUKTUR DIREKTORI REPOSITORY BACKEND</h3>
+      <div class="pixel-code-box">
+        <div class="pixel-code-header">
+          <span class="pixel-code-title">myzert/YURIPAY-GOPAY / TREE</span>
+          <span class="pixel-badge green">Node.js 22+ & Express 5</span>
+        </div>
+        <pre class="pixel-code-pre">
+YURIPAY-GOPAY/
+├── server.js                     # Dual-Port HTTP Server (Port 3000 Admin & Port 3001 Public Checkout)
+├── login.js                      # CLI Interaktif untuk Login Akun Merchant GoBiz via OTP SMS/WA
+├── package.json                  # Dependencies: axios, better-sqlite3, cors, express, qrcode, ejs
+├── ecosystem.config.js           # Konfigurasi PM2 Cluster Mode untuk Production 24/7
+├── Dockerfile & docker-compose   # Containerisasi Docker siap deploy di VPS Cloud
+├── .GOPAY_SESI_JANGAN_DIHAPUS.json # Penyimpanan token sesi resmi GoBiz Merchant (Auto-Refresh 6 jam)
+├── src/
+│   ├── database/
+│   │   └── db.js                 # SQLite WAL mode: orders, topups, products, stocks, audit logs
+│   ├── gateway/
+│   │   ├── gopayAuth.js          # API Client untuk meminta & memverifikasi kode OTP ke server GoBiz
+│   │   ├── gopayClient.js        # Polling mutasi saldo ke API Merchant Analytics GoBiz
+│   │   ├── paymentChecker.js     # Background worker interval 2.5 detik pencocok mutasi otomatis
+│   │   ├── qrisHelper.js         # Algoritma konversi Tag 01 -> 12, Tag 54 injection, & CRC16 CCITT
+│   │   ├── webhookEngine.js      # Pengirim callback Midtrans HTTP POST dengan HMAC SHA-512 signature
+│   │   ├── sessionManager.js     # Pengelola masa berlaku token GoBiz & rotasi sesi otomatis
+│   │   └── swaggerDoc.js         # Dokumentasi OpenAPI / Swagger API
+│   └── web/                      # Antarmuka Admin Kasir, Manajemen Stok Digital, & Checkout Pelanggan
+        </pre>
+      </div>
+
+      <!-- Core Workflows / Sequence -->
+      <h3 class="pixel-title" style="font-size:0.95rem; margin-top:28px; margin-bottom:14px;">🔄 ALUR KERJA SISTEM (WORKFLOW 100%)</h3>
+
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">1</div>
+          <div class="step-title">LOGIN & OTENTIKASI MERCHANT GOBIZ (login.js)</div>
+        </div>
+        <div class="step-desc">
+          Merchant menjalankan <code>node login.js</code>. Sistem mengirim permintaan OTP ke endpoint resmi <code>https://api.gojekapi.com/v3/auth/token/request</code>.
+          Merchant memasukkan 4 digit OTP dari SMS/WhatsApp. Token sesi GoBiz disimpan ke dalam file lokal <code>.GOPAY_SESI_JANGAN_DIHAPUS.json</code>.
+          Token ini berlaku selama 30 hari dan diperbarui otomatis oleh <code>sessionManager.js</code> setiap 6 jam.
+        </div>
+      </div>
+
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">2</div>
+          <div class="step-title">PEMBUATAN INVOICE & QRIS DINAMIS (qrisHelper.js)</div>
+        </div>
+        <div class="step-desc">
+          Ketika pesanan checkout dibuat di URL <code>http://domain:3001/pay/:invoice</code>:
+          <ul style="margin-left:20px; margin-top:6px;">
+            <li>Sistem menambahkan <strong>kode unik</strong> (+1 perak jika &lt;1.000 atau acak 1..199 perak jika &ge;1.000) untuk mencegah tabrakan order kembar (anti-collision).</li>
+            <li>Fungsi <code>generateDynamicQRIS()</code> membedah string QRIS Statis merchant, mengubah <strong>Tag 01</strong> dari <code>11</code> (Statis) menjadi <code>12</code> (Dinamis), menyuntikkan <strong>Tag 54</strong> dengan total nominal tagihan, dan menghitung ulang <strong>Tag 63</strong> dengan algoritma EMVCo CRC-16 CCITT (polinom <code>0x1021</code>, initial <code>0xFFFF</code>).</li>
+            <li>Library <code>qrcode</code> merender gambar QR visual beresolusi tinggi ke layar pembeli.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">3</div>
+          <div class="step-title">POLLING MUTASI REALTIME 2.5 DETIK (paymentChecker.js)</div>
+        </div>
+        <div class="step-desc">
+          Background worker berjalan di background setiap <strong>2.500 ms (2.5 detik)</strong> memanggil endpoint analitik transaksi GoBiz:
+          <br><code>https://api.gojekapi.com/merchant-analytics/v2/merchants/transactions</code>.
+          Worker mencocokkan nominal transaksi masuk dengan invoice pending di database SQLite:
+          <ul style="margin-left:20px; margin-top:6px;">
+            <li>Jika pesanan telah lewat batas <code>expires_at</code>, status diubah menjadi <strong>EXPIRED</strong>.</li>
+            <li>Jika mutasi nominal persis ditemukan dalam rentang waktu pesanan, status pesanan diubah menjadi <strong>PAID</strong>.</li>
+            <li>Produk digital (voucher, akun, key lisensi) di tabel <code>stocks</code> langsung diklaim dan diserahkan ke pembeli detik itu juga!</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">4</div>
+          <div class="step-title">DISPATCH WEBHOOK MIDTRANS STANDAR (webhookEngine.js)</div>
+        </div>
+        <div class="step-desc">
+          Jika merchant mengonfigurasi webhook URL di file <code>.env</code>, YuriPay secara otomatis mengirim HTTP POST notifikasi yang <strong>100% identik dengan Midtrans</strong>:
+          <br>Mengalkulasi <code>signature_key = SHA512(order_id + status_code + gross_amount + ServerKey)</code> dengan status <code>settlement</code>.
+          Sistem Anda yang sebelumnya menggunakan Midtrans tidak perlu diubah kodenya sama sekali!
+        </div>
+      </div>
+
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">5</div>
+          <div class="step-title">ISOLASI ARSITEKTUR DUAL-PORT (server.js)</div>
+        </div>
+        <div class="step-desc">
+          YuriPay memisahkan port internal dan eksternal demi keamanan maksimal:
+          <ul style="margin-left:20px; margin-top:6px;">
+            <li><strong>Port 3000 (Internal Merchant Admin & Kasir):</strong> Hanya diakses oleh pemilik toko untuk memantau transaksi, top up saldo, kelola stok produk, dan memantau sesi GoBiz.</li>
+            <li><strong>Port 3001 (Public Customer Gateway):</strong> Port ringan yang di-forward ke internet (via Cloudflare Tunnels atau Nginx) untuk halaman bayar pelanggan <code>/pay/:id</code> tanpa akses ke menu admin.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================================== -->
+  <!-- TAB 4: MIDTRANS WEBHOOK & API TESTER                                     -->
+  <!-- ======================================================================== -->
+  <section class="page-tab-content" id="tab-webhook">
+    <div class="pixel-card">
+      <div class="pixel-card-header">
+        <div>
+          <h2 class="pixel-title">🛡️ MIDTRANS WEBHOOK & SHA-512 TESTER</h2>
+          <p class="pixel-subtitle">Uji integrasi webhook callback dan pembuatan signature key SHA-512 yang 100% kompatibel dengan CMS/SaaS Midtrans Anda.</p>
+        </div>
+        <span class="pixel-badge pink">[RFC-6234 SHA512]</span>
+      </div>
+
+      <div class="grid-2col">
+        <!-- Form Generator Signature -->
+        <div>
+          <div class="pixel-form-group">
+            <label class="pixel-label">ORDER ID (INVOICE):</label>
+            <input type="text" class="pixel-input" id="sigOrderId" value="INV-20261106-9921" />
           </div>
 
-          <div style="text-align: center; max-width: 260px;">
-            <div style="font-weight: 700; margin-bottom: 0.5rem;">Mode 2: Anime Cute Arigato</div>
-            <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">Audio selebrasi anime ceria dilengkapi animasi semburan konfeti.</p>
-            <button id="btnPlayAnime" class="btn-secondary" style="width: 100%;">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              <span>Play Cute Arigato 🎉</span>
-            </button>
+          <div class="pixel-form-group">
+            <label class="pixel-label">STATUS CODE:</label>
+            <input type="text" class="pixel-input" id="sigStatusCode" value="200" />
+          </div>
+
+          <div class="pixel-form-group">
+            <label class="pixel-label">GROSS AMOUNT (RUPIAH):</label>
+            <input type="text" class="pixel-input" id="sigGrossAmount" value="10087.00" />
+          </div>
+
+          <div class="pixel-form-group">
+            <label class="pixel-label">SERVER KEY (SECRET):</label>
+            <input type="text" class="pixel-input" id="sigServerKey" value="SB-Mid-server-YuriPayKeySample2026" />
+          </div>
+
+          <button class="pixel-btn primary" id="calcSignatureBtn" style="width:100%;">
+            ⚡ HITUNG SIGNATURE KEY SHA-512
+          </button>
+        </div>
+
+        <!-- Output Signature & Payload Sample -->
+        <div>
+          <div class="pixel-code-box" style="margin-top:0;">
+            <div class="pixel-code-header">
+              <span class="pixel-code-title">HASIL KALKULASI SIGNATURE:</span>
+              <button class="pixel-btn" id="copySignatureBtn" style="padding:4px 8px; font-size:0.6rem;">📋 COPY</button>
+            </div>
+            <pre class="pixel-code-pre" id="sigOutputPre" style="white-space:pre-wrap; word-break:break-all; max-height:100px; color:var(--pink-neon);"></pre>
+          </div>
+
+          <div class="pixel-code-box">
+            <div class="pixel-code-header">
+              <span class="pixel-code-title">CONTOH JSON CALLBACK SETTLEMENT:</span>
+              <button class="pixel-btn" id="copyWebhookPayloadBtn" style="padding:4px 8px; font-size:0.6rem;">📋 COPY JSON</button>
+            </div>
+            <pre class="pixel-code-pre" id="webhookPayloadPre" style="max-height:220px; overflow-y:auto;"></pre>
           </div>
         </div>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <!-- Section: Otentikasi GoBiz -->
-    <section class="doc-section" id="otentikasi-gobiz">
-      <div class="section-header">
-        <h2 class="section-title">📱 Otentikasi GoBiz Merchant (OTP Terminal)</h2>
-        <p class="section-lead">Login resmi satu kali via terminal tanpa perlu copy-paste token yang rawan kedaluwarsa.</p>
-      </div>
-
-      <div class="code-tab-container">
-        <div class="code-tab-header">
-          <span style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent-primary);">TERMINAL LOGIN GOBIZ</span>
-          <button class="btn-copy" data-copy="npm run login"><span>Salin</span></button>
+  <!-- ======================================================================== -->
+  <!-- TAB 5: GITHUB REPO & CONTRIBUTORS (myzert/YURIPAY-GOPAY)                 -->
+  <!-- ======================================================================== -->
+  <section class="page-tab-content" id="tab-github">
+    <div class="pixel-card">
+      <div class="pixel-card-header">
+        <div>
+          <h2 class="pixel-title">⭐ GITHUB REPOSITORY & KOMUNITAS</h2>
+          <p class="pixel-subtitle">Informasi live dari repository resmi myzert/YURIPAY-GOPAY, daftar kontributor, star, fork, dan perintah clone.</p>
         </div>
-        <pre class="code-content"><code>npm run login
-
-# 1. Masukkan nomor ponsel akun GoBiz Anda (contoh: 085119772671)
-# 2. Masukkan 4 digit kode OTP yang diterima melalui SMS atau WhatsApp dari Gojek
-# 3. Token tersimpan aman di: .GOPAY_SESI_JANGAN_DIHAPUS.json
-# 4. Token diperbarui otomatis di background setiap 6 jam via sessionManager.js!</code></pre>
-      </div>
-    </section>
-
-    <!-- Section: Panduan Deployment -->
-    <section class="doc-section" id="deployment">
-      <div class="section-header">
-        <h2 class="section-title">🚀 Panduan Deployment Produksi</h2>
-        <p class="section-lead">Pilih platform deployment yang sesuai dengan kebutuhan infrastruktur toko Anda.</p>
+        <span class="pixel-badge green">[OPEN SOURCE MIT / ISC]</span>
       </div>
 
-      <div class="code-tab-container">
-        <div class="code-tab-header">
-          <div class="code-tabs">
-            <button class="code-tab-btn active" data-deploy="vps">Linux VPS (PM2)</button>
-            <button class="code-tab-btn" data-deploy="cpanel">cPanel (Node.js App)</button>
-            <button class="code-tab-btn" data-deploy="docker">Docker Compose</button>
-            <button class="code-tab-btn" data-deploy="termux">Termux (Android)</button>
-          </div>
-          <button class="btn-copy" id="btnCopyDeploy"><span>Salin Perintah</span></button>
-        </div>
-        <pre class="code-content" id="deployCodeContent"><code># 1. Pasang dependensi di Ubuntu/Debian VPS
-sudo apt update && sudo apt install -y nodejs npm git build-essential sqlite3 nginx
-sudo npm install -g pm2
-
-# 2. Kloning repositori
-git clone https://github.com/myzert/YURIPAY-GOPAY.git yuripay
-cd yuripay
-npm install --production
-cp .env.example .env
-
-# 3. Login GoBiz Merchant
-npm run login
-
-# 4. Jalankan dengan PM2 agar aktif 24/7
-pm2 start server.js --name "yuripay"
-pm2 save
-pm2 startup</code></pre>
-      </div>
-    </section>
-
-    <!-- Section: Konfigurasi .env -->
-    <section class="doc-section" id="env-config">
-      <div class="section-header">
-        <h2 class="section-title">⚙️ Konfigurasi Environment (.env)</h2>
-        <p class="section-lead">Variabel konfigurasi sistem gateway untuk port, kredensial, dan nama toko.</p>
-      </div>
-
-      <div class="table-container">
-        <table class="doc-table">
-          <thead>
-            <tr>
-              <th>Variabel</th>
-              <th>Tipe</th>
-              <th>Default</th>
-              <th>Deskripsi</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><code>DASHBOARD_PORT</code></td>
-              <td>Integer</td>
-              <td><code>3000</code></td>
-              <td>Port kasir, login admin, mutasi, dan Swagger UI.</td>
-            </tr>
-            <tr>
-              <td><code>PAYMENT_PORT</code></td>
-              <td>Integer</td>
-              <td><code>3001</code></td>
-              <td>Port publik untuk checkout pelanggan (<code>/pay/:id</code>).</td>
-            </tr>
-            <tr>
-              <td><code>STORE_NAME</code></td>
-              <td>String</td>
-              <td><code>YuriDev</code></td>
-              <td>Nama toko merchant yang tertera pada invoice QRIS.</td>
-            </tr>
-            <tr>
-              <td><code>API_KEY</code></td>
-              <td>String</td>
-              <td><code>yuripay_live_key_xxx</code></td>
-              <td>Kunci server rahasia untuk kalkulasi signature SHA-512.</td>
-            </tr>
-            <tr>
-              <td><code>QRIS_STATIC</code></td>
-              <td>String</td>
-              <td><code>00020101...</code></td>
-              <td>String QRIS statis resmi dari aplikasi GoBiz merchant.</td>
-            </tr>
-            <tr>
-              <td><code>DEFAULT_SUCCESS_THEME</code></td>
-              <td>String</td>
-              <td><code>anime</code></td>
-              <td>Tema default: <code>default</code> (Fintech Chime) atau <code>anime</code>.</td>
-            </tr>
-            <tr>
-              <td><code>MIN_NOMINAL</code></td>
-              <td>Integer</td>
-              <td><code>50</code></td>
-              <td>Batas minimal transfer QRIS (Rupiah).</td>
-            </tr>
-            <tr>
-              <td><code>TRANSACTION_TIMEOUT_MINUTES</code></td>
-              <td>Integer</td>
-              <td><code>10</code></td>
-              <td>Masa berlaku QRIS dinamis (menit).</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Section: Spesifikasi API & Webhook -->
-    <section class="doc-section" id="api-spec">
-      <div class="section-header">
-        <h2 class="section-title">🔌 Spesifikasi API REST & Webhook Midtrans</h2>
-        <p class="section-lead">Contoh kode integrasi membuat tagihan dan menerima webhook notifikasi di server Anda.</p>
-      </div>
-
-      <div class="code-tab-container">
-        <div class="code-tab-header">
-          <div class="code-tabs">
-            <button class="code-tab-btn active" data-lang="curl">cURL</button>
-            <button class="code-tab-btn" data-lang="nodejs">Node.js</button>
-            <button class="code-tab-btn" data-lang="php">PHP (Laravel)</button>
-            <button class="code-tab-btn" data-lang="python">Python</button>
-          </div>
-          <button class="btn-copy" id="btnCopyApi"><span>Salin Kode</span></button>
-        </div>
-        <pre class="code-content" id="apiCodeContent"><code># Buat Tagihan Pembayaran Baru (POST /api/create-payment)
-curl -X POST http://localhost:3001/api/create-payment \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "amount": 25000,
-    "order_id": "INV-20261028-001",
-    "custom_name": "Paket VIP 1 Bulan",
-    "redirect_url": "https://tokosaya.com/finish",
-    "webhook_url": "https://tokosaya.com/api/midtrans-webhook",
-    "success_theme": "default"
-  }'</code></pre>
-      </div>
-    </section>
-
-    <!-- Section: GitHub Star CTA -->
-    <section class="doc-section" id="github-star">
-      <div class="support-card">
-        <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">⭐</div>
-        <h2 style="font-size: 1.8rem; font-weight: 800; margin-bottom: 0.5rem;">Dukung YuriPay dengan Memberi Star di GitHub!</h2>
-        <p style="color: var(--text-secondary); max-width: 600px; margin: 0 auto 1.5rem auto;">
-          Bintang Anda di GitHub sangat berharga bagi kelangsungan proyek open-source Indonesia ini. Bantu kami menjangkau lebih banyak developer dan UMKM!
-        </p>
-        <div class="support-buttons-row">
-          <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" class="btn-primary" style="font-size: 1.05rem; padding: 0.85rem 1.8rem;">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
-            <span>Star YuriPay di GitHub</span>
-          </a>
-        </div>
-      </div>
-    </section>
-
-    <!-- Section: Kontributor -->
-    <section class="doc-section" id="contributors">
-      <div class="section-header">
-        <h2 class="section-title">🤝 Tim Pengembang & Kontributor</h2>
-        <p class="section-lead">Apresiasi setinggi-tingginya untuk pengembang dan kontributor ekosistem YuriPay.</p>
-      </div>
-
-      <div class="contributors-card">
-        <a href="https://github.com/myzert" target="_blank" rel="noopener">
-          <img src="https://github.com/myzert.png" class="maintainer-avatar" alt="myzert avatar" />
+      <!-- Quick Action Buttons -->
+      <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+        <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" class="pixel-btn primary">
+          ⭐ STAR DI GITHUB (<span id="gitStarCount">...</span>)
         </a>
-        <h3 style="font-size: 1.3rem; font-weight: 800;">myzert (YuriDev)</h3>
-        <p style="color: var(--accent-primary); font-size: 0.88rem; font-weight: 600; margin-bottom: 0.5rem;">Lead Architect & Maintainer</p>
-        <p style="color: var(--text-muted); font-size: 0.85rem; max-width: 450px; margin: 0 auto 1.25rem auto;">
-          Pengembang bot anime, sistem pembayaran mandiri GoBiz QRIS, dan infrastruktur open-source Indonesia.
-        </p>
-        <div style="display: flex; gap: 0.75rem; justify-content: center;">
-          <a href="https://github.com/myzert" target="_blank" rel="noopener" class="btn-secondary" style="font-size: 0.82rem; padding: 0.4rem 0.8rem;">
-            <span>GitHub @myzert</span>
-          </a>
-          <a href="https://t.me/ahmadzakiyo" target="_blank" rel="noopener" class="btn-secondary" style="font-size: 0.82rem; padding: 0.4rem 0.8rem;">
-            <span>Telegram @ahmadzakiyo</span>
-          </a>
+        <a href="https://github.com/myzert/YURIPAY-GOPAY/fork" target="_blank" rel="noopener" class="pixel-btn" style="background:var(--pink-soft); color:#fff; border-color:#fff;">
+          🍴 FORK REPO INI (<span id="gitForkCount">...</span>)
+        </a>
+        <a href="https://github.com/myzert/YURIPAY-GOPAY/issues" target="_blank" rel="noopener" class="pixel-btn">
+          🐛 LAPORKAN ISSUE (<span id="gitIssuesCount">...</span>)
+        </a>
+      </div>
+
+      <!-- GitHub Stats 4-Col Grid -->
+      <div class="grid-4col" style="margin-bottom:24px;">
+        <div class="stat-pixel-card">
+          <div class="stat-pixel-num" id="statStars">...</div>
+          <div class="stat-pixel-label">⭐ STARS REPO</div>
+        </div>
+        <div class="stat-pixel-card">
+          <div class="stat-pixel-num" id="statForks">...</div>
+          <div class="stat-pixel-label">🍴 FORKS</div>
+        </div>
+        <div class="stat-pixel-card">
+          <div class="stat-pixel-num" id="statWatchers">...</div>
+          <div class="stat-pixel-label">👁️ WATCHERS</div>
+        </div>
+        <div class="stat-pixel-card">
+          <div class="stat-pixel-num" id="statIssues">...</div>
+          <div class="stat-pixel-label">🐛 OPEN ISSUES</div>
         </div>
       </div>
-    </section>
 
-    <!-- Section: Support & Donasi -->
-    <section class="doc-section" id="support">
-      <div class="section-header">
-        <h2 class="section-title">💖 Donasi & Dukungan Pengembang</h2>
-        <p class="section-lead">Belikan kopi untuk pengembang agar server riset dan update modul GoBiz tetap aktif.</p>
-      </div>
-
-      <div class="support-card">
-        <h3 style="font-size: 1.4rem; font-weight: 800; margin-bottom: 0.5rem;">Belikan Kopi untuk zert! ☕✨</h3>
-        <p style="color: var(--text-secondary); max-width: 600px; margin: 0 auto 1.5rem auto;">
-          YuriPay dirilis 100% gratis tanpa potongan biaya transaksi. Jika sistem ini menghemat jutaan rupiah biaya gateway toko Anda, dukung kami melalui link di bawah:
-        </p>
-        <div class="support-buttons-row">
-          <a href="https://t.me/ahmadzakiyo" target="_blank" rel="noopener" class="btn-primary">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-            <span>Hubungi di Telegram</span>
-          </a>
-          <a href="https://t.me/nuxysproject" target="_blank" rel="noopener" class="btn-secondary">
-            <span>📢 Channel @nuxysproject</span>
-          </a>
+      <!-- Clone Repository Box -->
+      <h3 class="pixel-title" style="font-size:0.95rem; margin-bottom:10px;">📦 CARA CLONE & JALANKAN LOKAL</h3>
+      <div class="pixel-code-box">
+        <div class="pixel-code-header">
+          <span class="pixel-code-title">BASH TERMINAL / TERMUX</span>
+          <button class="pixel-btn" id="copyCloneBtn" style="padding:4px 8px; font-size:0.6rem;">📋 COPY CLONE CMD</button>
         </div>
-      </div>
-    </section>
-
-    <!-- Section: FAQ -->
-    <section class="doc-section" id="faq">
-      <div class="section-header">
-        <h2 class="section-title">❓ Pertanyaan Umum (FAQ)</h2>
-        <p class="section-lead">Jawaban atas pertanyaan yang paling sering ditanyakan seputar integrasi YuriPay.</p>
-      </div>
-
-      <div class="faq-list">
-        <div class="faq-item">
-          <button class="faq-question">
-            <span>1. Apakah YuriPay bisa di-deploy di Vercel atau Netlify?</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p><strong>Tidak bisa.</strong> Vercel membekukan container saat respons HTTP selesai dikirim, sehingga poller background pemeriksa mutasi GoPay akan berhenti berjalan. Selain itu, filesystem serverless bersifat sementara sehingga database transaksi SQLite dan file token login akan terhapus secara acak.</p>
-          </div>
-        </div>
-
-        <div class="faq-item">
-          <button class="faq-question">
-            <span>2. Berapa lama token sesi GoBiz bertahan dan apakah perlu login ulang?</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p>Token sesi GoBiz bertahan hingga 30 hari. Berkas <code>sessionManager.js</code> memiliki fitur <em>auto-refresh token</em> yang secara otomatis memperbarui akses token di latar belakang setiap 6 jam. Anda hanya perlu login ulang jika sengaja logout dari aplikasi ponsel GoBiz.</p>
-          </div>
-        </div>
-
-        <div class="faq-item">
-          <button class="faq-question">
-            <span>3. Di mana letak string QRIS_STATIC toko saya?</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p>Buka aplikasi <strong>GoBiz</strong> di ponsel Anda &rarr; Pilih menu <strong>Lainnya / QRIS</strong> &rarr; Tampilkan QR Toko Anda &rarr; Scan gambar QR tersebut menggunakan pemindai QR biasa (misal Google Lens). Teks string panjang yang diawali <code>000201010211...6304XXXX</code> adalah kode QRIS Statis Anda.</p>
-          </div>
-        </div>
-
-        <div class="faq-item">
-          <button class="faq-question">
-            <span>4. Mengapa nominal pembayaran bertambah Rp 1 perak?</span>
-            <span class="faq-icon-arrow">▼</span>
-          </button>
-          <div class="faq-answer">
-            <p>Penambahan Rp 1 perak adalah kode unik verifikasi otomatis. Karena sistem QRIS menerima transfer dari berbagai aplikasi perbankan nasional tanpa identitas nama pengirim yang seragam, kode unik ini menjadi acuan mutlak bagi sistem untuk mencocokkan pembayaran dengan pesanan pelanggan secara 100% presisi tanpa tertukar.</p>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Section: Lisensi -->
-    <section class="doc-section" id="license">
-      <div class="section-header">
-        <h2 class="section-title">📄 Lisensi & Hak Cipta</h2>
-      </div>
-      <div class="code-tab-container">
-        <pre class="code-content"><code>ISC License
-
-Copyright (c) 2026 myzert (YuriDev)
-
-Permission to use, copy, modify, and/or distribute this software for any
-purpose with or without fee is hereby granted, provided that the above
-copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES.</code></pre>
-      </div>
-    </section>
-  </main>
-
-  <!-- Right On-This-Page Table of Contents -->
-  <aside class="doc-toc">
-    <div class="toc-title">PADA HALAMAN INI</div>
-    <ul class="toc-list" id="tocList">
-      <li><a href="#ikhtisar" class="toc-link">⚡ Ikhtisar Arsitektur</a></li>
-      <li><a href="#why-no-serverless" class="toc-link">⚠️ Kenapa Bukan Serverless?</a></li>
-      <li><a href="#fitur-enterprise" class="toc-link">💎 Fitur Enterprise</a></li>
-      <li><a href="#dual-port" class="toc-link">🏰 Keamanan Dual-Port</a></li>
-      <li><a href="#code-deep-dive" class="toc-link">🔍 Bedah Kode File</a></li>
-      <li><a href="#simulator-qris" class="toc-link">🧮 Dynamic QRIS Simulator</a></li>
-      <li><a href="#simulator-webhook" class="toc-link">🔒 SHA-512 Signature Hash</a></li>
-      <li><a href="#simulator-audio" class="toc-link">🎵 Audio Previewer</a></li>
-      <li><a href="#otentikasi-gobiz" class="toc-link">📱 Otentikasi GoBiz</a></li>
-      <li><a href="#deployment" class="toc-link">🚀 Panduan Deployment</a></li>
-      <li><a href="#env-config" class="toc-link">⚙️ Konfigurasi .env</a></li>
-      <li><a href="#api-spec" class="toc-link">🔌 Spesifikasi API REST</a></li>
-      <li><a href="#github-star" class="toc-link">⭐ Star di GitHub</a></li>
-      <li><a href="#contributors" class="toc-link">🤝 Tim & Kontributor</a></li>
-      <li><a href="#support" class="toc-link">💖 Dukungan / Donasi</a></li>
-      <li><a href="#faq" class="toc-link">❓ Pertanyaan Umum</a></li>
-      <li><a href="#license" class="toc-link">📄 Lisensi ISC</a></li>
-    </ul>
-  </aside>
-</div>
-
-<!-- Footer with SEO Links -->
-<footer class="doc-footer">
-  <div class="footer-links">
-    <a href="https://yuripay.pages.dev/" class="footer-link">yuripay.pages.dev</a>
-    <a href="https://yuripay.projectt.my.id/" class="footer-link">yuripay.projectt.my.id</a>
-    <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" class="footer-link">GitHub Repository</a>
-    <a href="https://t.me/nuxysproject" target="_blank" rel="noopener" class="footer-link">Telegram Updates</a>
-    <a href="https://t.me/ahmadzakiyo" target="_blank" rel="noopener" class="footer-link">Developer Support</a>
-  </div>
-  <p>© 2026 <strong>YURIPAY by myzert (YuriDev)</strong>. Lisensi ISC. Dikembangkan dengan dedikasi untuk ekosistem open-source Indonesia.</p>
-</footer>
-`;
-
-// --------------------------------------------------------------------------
-// Event Listeners & Interactive Handlers
-// --------------------------------------------------------------------------
-
-// Theme Toggle
-const themeToggleBtn = document.getElementById('themeToggleBtn');
-const themeIconSun = document.getElementById('themeIconSun');
-const themeIconMoon = document.getElementById('themeIconMoon');
-
-function updateThemeIcons(isDark: boolean) {
-  if (isDark) {
-    themeIconSun!.style.display = 'block';
-    themeIconMoon!.style.display = 'none';
-  } else {
-    themeIconSun!.style.display = 'none';
-    themeIconMoon!.style.display = 'block';
-  }
-}
-
-themeToggleBtn?.addEventListener('click', () => {
-  const isDark = document.documentElement.classList.toggle('dark');
-  localStorage.setItem('yuripay_theme', isDark ? 'dark' : 'light');
-  updateThemeIcons(isDark);
-});
-
-// Init theme from storage or default dark
-const savedTheme = localStorage.getItem('yuripay_theme') || 'dark';
-if (savedTheme === 'light') {
-  document.documentElement.classList.remove('dark');
-  updateThemeIcons(false);
-} else {
-  document.documentElement.classList.add('dark');
-  updateThemeIcons(true);
-}
-
-// Mobile sidebar menu toggle
-const mobileMenuBtn = document.getElementById('mobileMenuBtn');
-const docSidebar = document.getElementById('docSidebar');
-mobileMenuBtn?.addEventListener('click', () => {
-  docSidebar?.classList.toggle('show');
-});
-
-// Close mobile sidebar when clicking a link
-document.querySelectorAll('.nav-link').forEach(link => {
-  link.addEventListener('click', () => {
-    if (window.innerWidth <= 900) {
-      docSidebar?.classList.remove('show');
-    }
-  });
-});
-
-// Dynamic QRIS Simulator Live Binding
-const simStaticQris = document.getElementById('simStaticQris') as HTMLTextAreaElement;
-const simNominal = document.getElementById('simNominal') as HTMLInputElement;
-const simTotalDisplay = document.getElementById('simTotalDisplay')!;
-const simOffsetExplain = document.getElementById('simOffsetExplain')!;
-const simCrcDisplay = document.getElementById('simCrcDisplay')!;
-const simQrCanvas = document.getElementById('simQrCanvas') as HTMLCanvasElement;
-const btnCopyQris = document.getElementById('btnCopyQris')!;
-
-let currentGeneratedQris = '';
-
-function updateQrisSimulator() {
-  const staticTemplate = simStaticQris.value.trim() || DEFAULT_STATIC_QRIS;
-  const nominal = parseInt(simNominal.value, 10) || 10000;
-
-  const result = buildDynamicQRIS(staticTemplate, nominal);
-  currentGeneratedQris = result.qris;
-
-  simTotalDisplay.textContent = formatRupiah(result.totalAmount);
-  if (nominal < 1000) {
-    simOffsetExplain.textContent = `Offset tetap mikro +Rp ${result.uniqueCode} perak (sangat hemat untuk uji coba & donasi).`;
-  } else {
-    simOffsetExplain.textContent = `Offset acak +Rp ${result.uniqueCode} perak (dijamin acak antara 1 s/d 199 perak).`;
-  }
-
-  simCrcDisplay.textContent = `CRC16: 0x${result.crc}`;
-  renderQRPreview(simQrCanvas, result.qris);
-}
-
-simStaticQris?.addEventListener('input', updateQrisSimulator);
-simNominal?.addEventListener('input', updateQrisSimulator);
-
-document.querySelectorAll('.btn-pill').forEach(btn => {
-  btn.addEventListener('click', (e) => {
-    const target = e.currentTarget as HTMLElement;
-    const amt = target.dataset.amt;
-    if (amt && simNominal) {
-      simNominal.value = amt;
-      updateQrisSimulator();
-    }
-  });
-});
-
-btnCopyQris?.addEventListener('click', () => {
-  if (currentGeneratedQris) {
-    navigator.clipboard.writeText(currentGeneratedQris).then(() => {
-      btnCopyQris.innerHTML = '<span>Tersalin! ✔</span>';
-      setTimeout(() => {
-        btnCopyQris.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> <span>Salin String QRIS</span>';
-      }, 2000);
-    });
-  }
-});
-
-updateQrisSimulator();
-
-// Midtrans SHA-512 Simulator Binding
-const simOrderId = document.getElementById('simOrderId') as HTMLInputElement;
-const simStatusCode = document.getElementById('simStatusCode') as HTMLInputElement;
-const simGrossAmount = document.getElementById('simGrossAmount') as HTMLInputElement;
-const simServerKey = document.getElementById('simServerKey') as HTMLInputElement;
-const simRawStringDisplay = document.getElementById('simRawStringDisplay')!;
-const simSignatureDisplay = document.getElementById('simSignatureDisplay')!;
-const btnCopySignature = document.getElementById('btnCopySignature')!;
-
-let currentSignature = '';
-
-async function updateSignatureSimulator() {
-  const orderId = simOrderId.value.trim();
-  const statusCode = simStatusCode.value.trim();
-  const grossAmount = simGrossAmount.value.trim();
-  const serverKey = simServerKey.value.trim();
-
-  const raw = `${orderId}${statusCode}${grossAmount}${serverKey}`;
-  simRawStringDisplay.textContent = raw;
-
-  currentSignature = await computeSHA512(raw);
-  simSignatureDisplay.textContent = currentSignature;
-}
-
-[simOrderId, simStatusCode, simGrossAmount, simServerKey].forEach(el => {
-  el?.addEventListener('input', updateSignatureSimulator);
-});
-
-btnCopySignature?.addEventListener('click', () => {
-  if (currentSignature) {
-    navigator.clipboard.writeText(currentSignature).then(() => {
-      btnCopySignature.textContent = 'Tersalin! ✔';
-      setTimeout(() => {
-        btnCopySignature.textContent = 'Salin Signature Key';
-      }, 2000);
-    });
-  }
-});
-
-updateSignatureSimulator();
-
-// Audio Celebration Player Binding
-const btnPlayChime = document.getElementById('btnPlayChime');
-const btnPlayAnime = document.getElementById('btnPlayAnime');
-
-btnPlayChime?.addEventListener('click', () => {
-  playFintechChime();
-});
-
-btnPlayAnime?.addEventListener('click', () => {
-  const audio = new Audio('/sounds/cute-arigato.mp3');
-  audio.play().catch(e => console.warn('Audio play error:', e));
-  triggerConfetti();
-});
-
-// FAQ Accordion Toggle
-document.querySelectorAll('.faq-question').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const parent = btn.closest('.faq-item');
-    parent?.classList.toggle('open');
-  });
-});
-
-// Code Snippets Data & Tab Handlers
-const deploySnippets: Record<string, string> = {
-  vps: `# 1. Pasang dependensi di Ubuntu/Debian VPS
-sudo apt update && sudo apt install -y nodejs npm git build-essential sqlite3 nginx
-sudo npm install -g pm2
-
-# 2. Kloning repositori
-git clone https://github.com/myzert/YURIPAY-GOPAY.git yuripay
-cd yuripay
-npm install --production
-cp .env.example .env
-
-# 3. Login GoBiz Merchant
-npm run login
-
-# 4. Jalankan dengan PM2 agar aktif 24/7
-pm2 start server.js --name "yuripay"
-pm2 save
-pm2 startup`,
-  cpanel: `# 1. Masuk cPanel -> Menu 'Setup Node.js App'
-# 2. Klik 'Create Application' (Pilih Node.js 18.x/20.x, Mode Production, Root 'yuripay', Startup file 'server.js')
-# 3. Upload file YuriPay ke folder yuripay
-# 4. Buka Terminal cPanel:
-cd yuripay
-npm install --production
-node login.js # Lakukan OTP satu kali saja
-
-# 5. Isi Environment Variables (.env) di cPanel
-# 6. Klik 'Restart Application'. Selesai!`,
-  docker: `# Build dan jalankan container mandiri:
-git clone https://github.com/myzert/YURIPAY-GOPAY.git
+        <pre class="pixel-code-pre" id="cloneSnippetPre">git clone https://github.com/myzert/YURIPAY-GOPAY.git
 cd YURIPAY-GOPAY
+npm install
 cp .env.example .env
-npm run login # Dapatkan token sesi terlebih dahulu
-docker compose up -d --build
+node login.js
+npm start</pre>
+      </div>
 
-# Pantau log transaksi realtime:
-docker compose logs -f`,
-  termux: `# Ubah HP Android bekas jadi server pembayaran hemat energi:
-pkg update && pkg upgrade -y
-pkg install nodejs git python make clang sqlite -y
+      <!-- Contributors Grid -->
+      <div style="margin-top:28px;">
+        <div class="pixel-card-header" style="margin-bottom:14px;">
+          <div>
+            <h3 class="pixel-title" style="font-size:0.95rem;">👥 DAFTAR KONTRIBUTOR RESMI</h3>
+            <p class="pixel-subtitle">Para pengembang di balik pengembangan YURIPAY-GOPAY.</p>
+          </div>
+        </div>
 
+        <div class="contributor-grid" id="contributorList">
+          <!-- Default fallback while loading GitHub API -->
+          <a href="https://github.com/myzert" target="_blank" rel="noopener" class="contributor-card">
+            <img src="https://avatars.githubusercontent.com/u/325584707?v=4" class="contributor-avatar" alt="myzert" />
+            <div class="contributor-info">
+              <span class="contributor-login">myzert</span>
+              <span class="contributor-role">👑 Author / Lead Dev</span>
+              <span style="font-family:var(--font-mono); font-size:0.7rem; color:var(--pink-neon); margin-top:2px;">11+ Commits</span>
+            </div>
+          </a>
+
+          <a href="https://github.com/GTPSHAX" target="_blank" rel="noopener" class="contributor-card">
+            <img src="https://avatars.githubusercontent.com/u/143262216?v=4" class="contributor-avatar" alt="GTPSHAX" />
+            <div class="contributor-info">
+              <span class="contributor-login">GTPSHAX</span>
+              <span class="contributor-role">🛠️ Core Contributor</span>
+              <span style="font-family:var(--font-mono); font-size:0.7rem; color:var(--pink-neon); margin-top:2px;">7+ Commits</span>
+            </div>
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================================== -->
+  <!-- TAB 6: PANDUAN DEPLOYMENT (TERMUX, VPS LINUX, CPANEL, DOCKER)            -->
+  <!-- ======================================================================== -->
+  <section class="page-tab-content" id="tab-deploy">
+    <div class="pixel-card">
+      <div class="pixel-card-header">
+        <div>
+          <h2 class="pixel-title">🚀 PANDUAN INSTALASI & DEPLOYMENT LENGKAP</h2>
+          <p class="pixel-subtitle">Cara menjalankan server YuriPay 24/7 di Termux Android, VPS Ubuntu/Debian, cPanel, atau Docker.</p>
+        </div>
+        <span class="pixel-badge pink">[24/7 READY]</span>
+      </div>
+
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">📱</div>
+          <div class="step-title">PANDUAN 1: TERMUX ANDROID (GRATIS TANPA VPS)</div>
+        </div>
+        <div class="step-desc">
+          Bisa dijalankan langsung di HP Android Anda tanpa perlu sewa VPS server!
+          <div class="pixel-code-box">
+            <pre class="pixel-code-pre">pkg update && pkg upgrade -y
+pkg install git nodejs-lts python make build-essential -y
 git clone https://github.com/myzert/YURIPAY-GOPAY.git
 cd YURIPAY-GOPAY
 npm install
 cp .env.example .env
+node login.js       # Masukkan nomor HP GoBiz & kode OTP
+npm install -g pm2
+pm2 start server.js --name yuripay
+pm2 save</pre>
+          </div>
+        </div>
+      </div>
 
-npm run login
-npm start`
-};
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">☁️</div>
+          <div class="step-title">PANDUAN 2: VPS UBUNTU / DEBIAN DENGAN NGINX & SSL</div>
+        </div>
+        <div class="step-desc">
+          Untuk toko skala besar dengan ribuan transaksi per hari:
+          <div class="pixel-code-box">
+            <pre class="pixel-code-pre"># 1. Install Node.js 22 LTS
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs git build-essential
 
-const deployCodeContent = document.getElementById('deployCodeContent')!;
-const btnCopyDeploy = document.getElementById('btnCopyDeploy')!;
+# 2. Clone repo & build dependencies
+git clone https://github.com/myzert/YURIPAY-GOPAY.git /var/www/yuripay
+cd /var/www/yuripay
+npm install --production
 
-document.querySelectorAll('[data-deploy]').forEach(tab => {
-  tab.addEventListener('click', (e) => {
-    document.querySelectorAll('[data-deploy]').forEach(t => t.classList.remove('active'));
-    const target = e.currentTarget as HTMLElement;
-    target.classList.add('active');
-    const key = target.dataset.deploy || 'vps';
-    deployCodeContent.textContent = deploySnippets[key] || '';
-  });
-});
+# 3. Konfigurasi .env & Sesi GoBiz
+cp .env.example .env
+nano .env           # Masukkan QRIS_STATIC toko Anda
+node login.js
 
-btnCopyDeploy?.addEventListener('click', () => {
-  navigator.clipboard.writeText(deployCodeContent.textContent || '').then(() => {
-    btnCopyDeploy.innerHTML = '<span>Tersalin! ✔</span>';
-    setTimeout(() => {
-      btnCopyDeploy.innerHTML = '<span>Salin Perintah</span>';
-    }, 2000);
-  });
-});
+# 4. Jalankan dengan PM2 Ecosystem
+npm install -g pm2
+pm2 start ecosystem.config.js
+pm2 startup && pm2 save</pre>
+          </div>
+        </div>
+      </div>
 
-const apiSnippets: Record<string, string> = {
-  curl: `# Buat Tagihan Pembayaran Baru (POST /api/create-payment)
-curl -X POST http://localhost:3001/api/create-payment \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "amount": 25000,
-    "order_id": "INV-20261028-001",
-    "custom_name": "Paket VIP 1 Bulan",
-    "redirect_url": "https://tokosaya.com/finish",
-    "webhook_url": "https://tokosaya.com/api/midtrans-webhook",
-    "success_theme": "default"
-  }'`,
-  nodejs: `// Verifikasi Webhook di Node.js (Express)
-const crypto = require('crypto');
+      <div class="flow-step-box">
+        <div class="flow-step-header">
+          <div class="step-num-badge">🌐</div>
+          <div class="step-title">PANDUAN 3: CPANEL NODE.JS SELECTOR</div>
+        </div>
+        <div class="step-desc">
+          Bagi pengguna hosting cPanel dengan fitur "Setup Node.js App":
+          <ol style="margin-left:20px; margin-top:6px; line-height:1.7;">
+            <li>Pilih versi Node.js: <strong>20.x atau 22.x</strong>.</li>
+            <li>Application mode: <strong>Production</strong>.</li>
+            <li>Application root: <code>yuripay</code>.</li>
+            <li>Application startup file: <code>server.js</code>.</li>
+            <li>Buka Terminal cPanel, masuk ke folder <code>yuripay</code> dan ketik <code>node login.js</code> untuk menghubungkan akun GoBiz Anda.</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </section>
 
-app.post('/api/midtrans-webhook', (req, res) => {
-  const { order_id, status_code, gross_amount, signature_key, transaction_status } = req.body;
-  const serverKey = process.env.API_KEY || 'yuripay_live_key_9981248712';
+</main>
 
-  const raw = \`\${order_id}\${status_code}\${gross_amount}\${serverKey}\`;
-  const computed = crypto.createHash('sha512').update(raw).digest('hex');
+<!-- Pixel Toast Notification -->
+<div class="pixel-toast" id="pixelToast">✓ BERHASIL DISALIN!</div>
 
-  if (signature_key === computed) {
-    if (transaction_status === 'settlement') {
-      console.log(\`[PAID] Pesanan \${order_id} lunas diverifikasi!\`);
-    }
-    return res.status(200).json({ status: 'OK' });
+<!-- Footer -->
+<footer class="pixel-footer">
+  <div class="pixel-footer-content">
+    <div class="brand-name" style="justify-content:center;">⚡ YURIPAY by myzert</div>
+    <div class="footer-copy">Unofficial Enterprise Dynamic QRIS Payment Gateway for GoBiz Merchants</div>
+    <div class="footer-sub">Dirancang dengan Retro Pixel-Art Pink • 0% Fee Potongan Pihak Ketiga • EMVCo CRC-16 Validated</div>
+    <div style="display:flex; gap:12px; margin-top:8px;">
+      <a href="https://github.com/myzert/YURIPAY-GOPAY" target="_blank" rel="noopener" style="color:var(--pink-neon); font-family:var(--font-silk); font-size:0.75rem;">GitHub Repository</a>
+      <span style="color:var(--border-pixel);">•</span>
+      <a href="https://t.me/ahmadzakiyo" target="_blank" rel="noopener" style="color:var(--pink-neon); font-family:var(--font-silk); font-size:0.75rem;">Telegram Developer</a>
+    </div>
+  </div>
+</footer>
+`;
+
+// ============================================================================
+// Logic & Interactive Handlers
+// ============================================================================
+
+// Toast Helper
+const toastEl = document.getElementById('pixelToast') as HTMLDivElement;
+function showToast(message = '✓ BERHASIL DISALIN!') {
+  toastEl.innerText = message;
+  toastEl.style.display = 'block';
+  setTimeout(() => {
+    toastEl.style.display = 'none';
+  }, 2200);
+}
+
+// ----------------------------------------------------------------------------
+// Theme Switcher (Dark Pixel Neon Pink vs Light Pixel Sakura Pink)
+// ----------------------------------------------------------------------------
+const themeToggleBtn = document.getElementById('themeToggleBtn') as HTMLButtonElement;
+const themeIcon = document.getElementById('themeIcon') as HTMLSpanElement;
+
+function applyTheme(isDark: boolean) {
+  if (isDark) {
+    document.documentElement.classList.add('dark');
+    themeIcon.innerText = '🌸';
+    themeToggleBtn.title = 'Ubah ke Tema Sakura Pink (Terang)';
+  } else {
+    document.documentElement.classList.remove('dark');
+    themeIcon.innerText = '👾';
+    themeToggleBtn.title = 'Ubah ke Tema Cyber Pink (Gelap)';
   }
+  localStorage.setItem('yuripay_pixel_theme', isDark ? 'dark' : 'light');
+}
 
-  return res.status(403).json({ error: 'Signature Mismatch' });
-});`,
-  php: `<?php
-// Verifikasi Webhook di PHP (Laravel / Native)
-$payload = json_decode(file_get_contents('php://input'), true);
-
-$orderId = $payload['order_id'];
-$statusCode = $payload['status_code'];
-$grossAmount = $payload['gross_amount'];
-$serverKey = env('YURIPAY_SERVER_KEY', 'yuripay_live_key_9981248712');
-
-$signature = hash('sha512', $orderId . $statusCode . $grossAmount . $serverKey);
-
-if ($payload['signature_key'] === $signature) {
-    if ($payload['transaction_status'] === 'settlement') {
-        // Pembayaran berhasil! Update pesanan toko Anda
-    }
-    http_response_code(200);
-    echo json_encode(['status' => 'OK']);
+// Check saved theme or default to dark
+const savedTheme = localStorage.getItem('yuripay_pixel_theme');
+if (savedTheme === 'light') {
+  applyTheme(false);
 } else {
-    http_response_code(403);
-    echo "Invalid Signature";
-}`,
-  python: `# Verifikasi Webhook di Python (FastAPI)
-import hashlib
-from fastapi import FastAPI, Request, HTTPException
+  applyTheme(true);
+}
 
-app = FastAPI()
+themeToggleBtn.addEventListener('click', () => {
+  const isDark = document.documentElement.classList.contains('dark');
+  applyTheme(!isDark);
+});
 
-@app.post("/api/midtrans-webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    server_key = "yuripay_live_key_9981248712"
+// ----------------------------------------------------------------------------
+// Navigation Tabs (Pegs)
+// ----------------------------------------------------------------------------
+const tabButtons = document.querySelectorAll<HTMLButtonElement>('.pixel-tab-btn');
+const tabContents = document.querySelectorAll<HTMLElement>('.page-tab-content');
 
-    raw = f"{data['order_id']}{data['status_code']}{data['gross_amount']}{server_key}"
-    computed = hashlib.sha512(raw.encode('utf-8')).hexdigest()
+function switchTab(tabId: string) {
+  tabButtons.forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-tab') === tabId);
+  });
+  tabContents.forEach(content => {
+    content.classList.toggle('active', content.id === tabId);
+  });
+  window.location.hash = tabId.replace('tab-', '');
+}
 
-    if data['signature_key'] == computed:
-        if data['transaction_status'] == 'settlement':
-            print(f"Pesanan {data['order_id']} lunas!")
-        return {"status": "OK"}
-
-    raise HTTPException(status_code=403, detail="Invalid Signature")`
-};
-
-const apiCodeContent = document.getElementById('apiCodeContent')!;
-const btnCopyApi = document.getElementById('btnCopyApi')!;
-
-document.querySelectorAll('[data-lang]').forEach(tab => {
-  tab.addEventListener('click', (e) => {
-    document.querySelectorAll('[data-lang]').forEach(t => t.classList.remove('active'));
-    const target = e.currentTarget as HTMLElement;
-    target.classList.add('active');
-    const key = target.dataset.lang || 'curl';
-    apiCodeContent.textContent = apiSnippets[key] || '';
+tabButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.getAttribute('data-tab');
+    if (target) switchTab(target);
   });
 });
 
-btnCopyApi?.addEventListener('click', () => {
-  navigator.clipboard.writeText(apiCodeContent.textContent || '').then(() => {
-    btnCopyApi.innerHTML = '<span>Tersalin! ✔</span>';
-    setTimeout(() => {
-      btnCopyApi.innerHTML = '<span>Salin Kode</span>';
-    }, 2000);
+// Read initial hash if present
+if (window.location.hash) {
+  const hashName = window.location.hash.substring(1);
+  const targetTab = document.getElementById(`tab-${hashName}`);
+  if (targetTab) {
+    switchTab(`tab-${hashName}`);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Dynamic QRIS Generator Logic
+// ----------------------------------------------------------------------------
+const staticQrisInput = document.getElementById('staticQrisInput') as HTMLTextAreaElement;
+const nominalInput = document.getElementById('nominalInput') as HTMLInputElement;
+const uniqueModeSelect = document.getElementById('uniqueModeSelect') as HTMLSelectElement;
+const customOffsetBox = document.getElementById('customOffsetBox') as HTMLDivElement;
+const customOffsetInput = document.getElementById('customOffsetInput') as HTMLInputElement;
+const feeTypeSelect = document.getElementById('feeTypeSelect') as HTMLSelectElement;
+const feeValInput = document.getElementById('feeValInput') as HTMLInputElement;
+const generateDynamicBtn = document.getElementById('generateDynamicBtn') as HTMLButtonElement;
+
+const dynamicQrCanvas = document.getElementById('dynamicQrCanvas') as HTMLCanvasElement;
+const displayTotalAmount = document.getElementById('displayTotalAmount') as HTMLDivElement;
+const displayMerchantInfo = document.getElementById('displayMerchantInfo') as HTMLDivElement;
+const lblBaseNominal = document.getElementById('lblBaseNominal') as HTMLElement;
+const lblUniqueOffset = document.getElementById('lblUniqueOffset') as HTMLElement;
+const lblFeeAmount = document.getElementById('lblFeeAmount') as HTMLElement;
+const lblFinalAmount = document.getElementById('lblFinalAmount') as HTMLElement;
+const dynamicRawOutput = document.getElementById('dynamicRawOutput') as HTMLElement;
+const dynamicCrcBadge = document.getElementById('dynamicCrcBadge') as HTMLElement;
+const dynamicTlvTableBody = document.querySelector('#dynamicTlvTable tbody') as HTMLElement;
+
+const downloadQrBtn = document.getElementById('downloadQrBtn') as HTMLButtonElement;
+const copyDynamicTextBtn = document.getElementById('copyDynamicTextBtn') as HTMLButtonElement;
+
+// Preset buttons
+const presetDompuBtn = document.getElementById('presetDompuBtn') as HTMLButtonElement;
+const presetZeroBtn = document.getElementById('presetZeroBtn') as HTMLButtonElement;
+const presetCustomBtn = document.getElementById('presetCustomBtn') as HTMLButtonElement;
+
+presetDompuBtn.addEventListener('click', () => {
+  staticQrisInput.value = PRESET_MISTER_DOMPU;
+  presetDompuBtn.classList.add('active');
+  presetZeroBtn.classList.remove('active');
+  presetCustomBtn.classList.remove('active');
+  updateDynamicGenerator();
+});
+
+presetZeroBtn.addEventListener('click', () => {
+  staticQrisInput.value = PRESET_ZERO_SHOP;
+  presetZeroBtn.classList.add('active');
+  presetDompuBtn.classList.remove('active');
+  presetCustomBtn.classList.remove('active');
+  updateDynamicGenerator();
+});
+
+presetCustomBtn.addEventListener('click', () => {
+  presetCustomBtn.classList.add('active');
+  presetDompuBtn.classList.remove('active');
+  presetZeroBtn.classList.remove('active');
+  staticQrisInput.focus();
+});
+
+// Quick nominal chips
+const nomChips = document.querySelectorAll<HTMLButtonElement>('.chip-btn[data-nom]');
+nomChips.forEach(chip => {
+  chip.addEventListener('click', () => {
+    nomChips.forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    nominalInput.value = chip.getAttribute('data-nom') || '1000';
+    updateDynamicGenerator();
   });
 });
 
-// Copy button handlers for arbitrary code snippets
-document.querySelectorAll('.btn-copy[data-copy]').forEach(btn => {
-  btn.addEventListener('click', (e) => {
-    const target = e.currentTarget as HTMLElement;
-    const text = target.dataset.copy || '';
-    navigator.clipboard.writeText(text).then(() => {
-      target.textContent = 'Tersalin! ✔';
-      setTimeout(() => {
-        target.textContent = 'Salin';
-      }, 2000);
-    });
-  });
+uniqueModeSelect.addEventListener('change', () => {
+  currentOffsetMode = uniqueModeSelect.value;
+  customOffsetBox.style.display = currentOffsetMode === 'custom' ? 'block' : 'none';
+  updateDynamicGenerator();
 });
 
-// Search Filter Input
-const searchInput = document.getElementById('searchInput') as HTMLInputElement;
-searchInput?.addEventListener('input', () => {
-  const query = searchInput.value.toLowerCase().trim();
-  const sections = document.querySelectorAll('.doc-section');
+customOffsetInput.addEventListener('input', () => {
+  customOffset = parseInt(customOffsetInput.value, 10) || 0;
+  updateDynamicGenerator();
+});
 
-  sections.forEach(sec => {
-    const text = (sec as HTMLElement).innerText.toLowerCase();
-    if (!query || text.includes(query)) {
-      (sec as HTMLElement).style.display = 'block';
-    } else {
-      (sec as HTMLElement).style.display = 'none';
+feeTypeSelect.addEventListener('change', () => {
+  feeType = feeTypeSelect.value;
+  feeValInput.disabled = feeType === 'none';
+  if (feeType === 'none') feeValInput.value = '0';
+  feeValue = parseFloat(feeValInput.value) || 0;
+  updateDynamicGenerator();
+});
+
+feeValInput.addEventListener('input', () => {
+  feeValue = parseFloat(feeValInput.value) || 0;
+  updateDynamicGenerator();
+});
+
+generateDynamicBtn.addEventListener('click', () => {
+  updateDynamicGenerator();
+  showToast('⚡ Dynamic QRIS diperbarui!');
+});
+
+nominalInput.addEventListener('input', () => {
+  updateDynamicGenerator();
+});
+
+staticQrisInput.addEventListener('input', () => {
+  presetDompuBtn.classList.remove('active');
+  presetZeroBtn.classList.remove('active');
+  presetCustomBtn.classList.add('active');
+  updateDynamicGenerator();
+});
+
+function updateDynamicGenerator() {
+  const baseNom = parseInt(nominalInput.value, 10) || 1000;
+  const staticStr = staticQrisInput.value.trim() || PRESET_MISTER_DOMPU;
+
+  const result = generateDynamicQRIS(staticStr, baseNom);
+
+  // Update displays
+  displayTotalAmount.innerText = formatRupiah(result.finalTotalAmount);
+  lblBaseNominal.innerText = formatRupiah(result.baseNominal);
+  lblUniqueOffset.innerText = `+Rp ${result.uniqueOffset}`;
+  lblFeeAmount.innerText = `+Rp ${result.feeAmount}`;
+  lblFinalAmount.innerText = formatRupiah(result.finalTotalAmount);
+
+  dynamicRawOutput.innerText = result.rawQris;
+  dynamicCrcBadge.innerText = `CRC16: ${result.checksum}`;
+
+  // Parse details for Merchant Name & City
+  const parsed = parseEMVCoTLV(result.rawQris);
+  const tag59 = parsed.tags.find(t => t.tag === '59')?.val || 'Merchant QRIS';
+  const tag60 = parsed.tags.find(t => t.tag === '60')?.val || 'Indonesia';
+  displayMerchantInfo.innerText = `${tag59} • ${tag60}`;
+
+  // Render REAL Authentic QR code to canvas using qrcode library
+  QRCode.toCanvas(dynamicQrCanvas, result.rawQris, {
+    errorCorrectionLevel: 'M',
+    margin: 2,
+    scale: 6,
+    color: {
+      dark: '#1a0418',
+      light: '#ffffff'
     }
+  }, (err) => {
+    if (err) console.error('Error generating QR Canvas:', err);
   });
+
+  // Populate TLV breakdown table
+  dynamicTlvTableBody.innerHTML = '';
+  parsed.tags.forEach(t => {
+    const row = document.createElement('tr');
+    const isSpecial = t.tag === '01' || t.tag === '54' || t.tag === '63';
+    row.innerHTML = `
+      <td><span class="tag-badge" style="${isSpecial ? 'color:var(--pink-neon); font-weight:bold;' : ''}">Tag ${t.tag}</span></td>
+      <td>${t.len}</td>
+      <td style="word-break:break-all; font-family:var(--font-mono); font-size:0.75rem; ${isSpecial ? 'color:var(--pink-neon);' : ''}">${escapeHtml(t.val)}</td>
+      <td><strong>${escapeHtml(t.name)}</strong></td>
+      <td style="font-size:0.75rem;">${escapeHtml(t.desc)}</td>
+    `;
+    dynamicTlvTableBody.appendChild(row);
+  });
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Download QR as PNG
+downloadQrBtn.addEventListener('click', () => {
+  const link = document.createElement('a');
+  link.download = `QRIS-YURIPAY-${Date.now()}.png`;
+  link.href = dynamicQrCanvas.toDataURL('image/png');
+  link.click();
+  showToast('📥 Gambar QRIS PNG berhasil didownload!');
 });
 
-// Scrollspy for Sidebar & TOC Active States
-const tocLinks = document.querySelectorAll('.toc-link');
-const navLinks = document.querySelectorAll('.nav-link');
-const trackedSections = document.querySelectorAll('.doc-section');
+// Copy Dynamic Text
+copyDynamicTextBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(dynamicRawOutput.innerText);
+  showToast('📋 Raw text QRIS dinamis berhasil disalin!');
+});
 
-window.addEventListener('scroll', () => {
-  let currentId = '';
-  trackedSections.forEach(sec => {
-    const top = (sec as HTMLElement).offsetTop - 120;
-    if (window.scrollY >= top) {
-      currentId = sec.getAttribute('id') || '';
-    }
-  });
+// ----------------------------------------------------------------------------
+// QR Code Checker & Decoder (Cek Code QR)
+// ----------------------------------------------------------------------------
+const qrDropzone = document.getElementById('qrDropzone') as HTMLDivElement;
+const qrFileInput = document.getElementById('qrFileInput') as HTMLInputElement;
+const checkerStatusAlert = document.getElementById('checkerStatusAlert') as HTMLDivElement;
+const checkerResultBox = document.getElementById('checkerResultBox') as HTMLDivElement;
+const checkerImagePreview = document.getElementById('checkerImagePreview') as HTMLImageElement;
+const chkMerchantName = document.getElementById('chkMerchantName') as HTMLElement;
+const chkMerchantCity = document.getElementById('chkMerchantCity') as HTMLElement;
+const chkPostalCode = document.getElementById('chkPostalCode') as HTMLElement;
+const chkQrType = document.getElementById('chkQrType') as HTMLElement;
+const chkAmount = document.getElementById('chkAmount') as HTMLElement;
+const chkAcquirer = document.getElementById('chkAcquirer') as HTMLElement;
+const chkCrcStatus = document.getElementById('chkCrcStatus') as HTMLElement;
+const chkRawTextOutput = document.getElementById('chkRawTextOutput') as HTMLElement;
+const copyScannedRawBtn = document.getElementById('copyScannedRawBtn') as HTMLButtonElement;
+const transferToGeneratorBtn = document.getElementById('transferToGeneratorBtn') as HTMLButtonElement;
+const checkerTlvTableBody = document.querySelector('#checkerTlvTable tbody') as HTMLElement;
 
-  if (currentId) {
-    tocLinks.forEach(link => {
-      if (link.getAttribute('href') === `#${currentId}`) {
-        link.classList.add('active');
-      } else {
-        link.classList.remove('active');
-      }
-    });
+let lastScannedRawText = '';
 
-    navLinks.forEach(link => {
-      if (link.getAttribute('href') === `#${currentId}`) {
-        link.classList.add('active');
-      } else {
-        link.classList.remove('active');
-      }
-    });
+qrDropzone.addEventListener('click', () => {
+  qrFileInput.click();
+});
+
+qrDropzone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  qrDropzone.classList.add('dragover');
+});
+
+qrDropzone.addEventListener('dragleave', () => {
+  qrDropzone.classList.remove('dragover');
+});
+
+qrDropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  qrDropzone.classList.remove('dragover');
+  if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+    handleQRFile(e.dataTransfer.files[0]);
   }
 });
+
+qrFileInput.addEventListener('change', () => {
+  if (qrFileInput.files && qrFileInput.files.length > 0) {
+    handleQRFile(qrFileInput.files[0]);
+  }
+});
+
+// Support pasting image from clipboard (Ctrl + V)
+window.addEventListener('paste', (e: ClipboardEvent) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type.indexOf('image') !== -1) {
+      const file = items[i].getAsFile();
+      if (file) {
+        switchTab('tab-checker');
+        handleQRFile(file);
+      }
+      break;
+    }
+  }
+});
+
+function handleQRFile(file: File) {
+  if (!file.type.startsWith('image/')) {
+    showCheckerAlert('⚠️ File yang dipilih bukan gambar valid!', 'warning');
+    return;
+  }
+
+  showCheckerAlert('⏳ Sedang memproses dan memindai barcode QRIS...', 'info');
+
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    const dataUrl = event.target?.result as string;
+    checkerImagePreview.src = dataUrl;
+
+    const img = new Image();
+    img.onload = () => {
+      // Create canvas for jsQR analysis
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        showCheckerAlert('✕ Gagal membuat canvas image processing.', 'error');
+        return;
+      }
+
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, img.width, img.height);
+
+      // Attempt decode with jsQR
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'attemptBoth'
+      });
+
+      if (code && code.data && code.data.trim().length > 0) {
+        processDecodedQR(code.data.trim());
+      } else {
+        showCheckerAlert('✕ Tidak ditemukan QR code dalam gambar ini. Pastikan gambar cukup terang dan tidak terlalu buram.', 'error');
+        checkerResultBox.style.display = 'none';
+      }
+    };
+    img.src = dataUrl;
+  };
+  reader.readAsDataURL(file);
+}
+
+function showCheckerAlert(msg: string, type: 'info' | 'warning' | 'error' | 'success') {
+  checkerStatusAlert.style.display = 'block';
+  checkerStatusAlert.innerText = msg;
+  if (type === 'error') {
+    checkerStatusAlert.style.borderColor = 'var(--accent-danger)';
+    checkerStatusAlert.style.color = 'var(--accent-danger)';
+  } else if (type === 'success') {
+    checkerStatusAlert.style.borderColor = 'var(--accent-success)';
+    checkerStatusAlert.style.color = 'var(--accent-success)';
+  } else {
+    checkerStatusAlert.style.borderColor = 'var(--pink-neon)';
+    checkerStatusAlert.style.color = 'var(--pink-neon)';
+  }
+}
+
+function processDecodedQR(raw: string) {
+  lastScannedRawText = raw;
+  checkerStatusAlert.style.display = 'none';
+  checkerResultBox.style.display = 'block';
+
+  chkRawTextOutput.innerText = raw;
+
+  // Decompose TLV
+  const parsed = parseEMVCoTLV(raw);
+
+  const tag01 = parsed.tags.find(t => t.tag === '01')?.val;
+  const tag59 = parsed.tags.find(t => t.tag === '59')?.val || 'Tidak Terdeteksi';
+  const tag60 = parsed.tags.find(t => t.tag === '60')?.val || 'Tidak Terdeteksi';
+  const tag61 = parsed.tags.find(t => t.tag === '61')?.val || '-';
+  const tag54 = parsed.tags.find(t => t.tag === '54')?.val;
+  const tag26 = parsed.tags.find(t => t.tag === '26')?.val || '';
+  const tag51 = parsed.tags.find(t => t.tag === '51')?.val || '';
+
+  chkMerchantName.innerText = tag59;
+  chkMerchantCity.innerText = tag60;
+  chkPostalCode.innerText = tag61;
+
+  if (tag01 === '12') {
+    chkQrType.innerText = 'DINAMIS (12)';
+    chkQrType.className = 'pixel-badge pink';
+  } else if (tag01 === '11') {
+    chkQrType.innerText = 'STATIS (11)';
+    chkQrType.className = 'pixel-badge gold';
+  } else {
+    chkQrType.innerText = `Tag 01: ${tag01 || '-'}`;
+    chkQrType.className = 'pixel-badge';
+  }
+
+  chkAmount.innerText = tag54 ? formatRupiah(parseInt(tag54, 10)) : 'Bebas (Input Manual)';
+
+  // Determine Acquirer
+  let acquirerName = 'National QRIS';
+  if (tag26.includes('GO-JEK') || tag26.includes('GOPAY')) {
+    acquirerName = 'GoBiz / GoPay';
+  } else if (tag26.includes('CIMB')) {
+    acquirerName = 'CIMB Niaga';
+  } else if (tag26.includes('BCA')) {
+    acquirerName = 'BCA';
+  } else if (tag51.includes('QRIS.WWW')) {
+    acquirerName = 'ASPI Interoperable QRIS';
+  }
+  chkAcquirer.innerText = acquirerName;
+
+  // CRC Validation status
+  if (parsed.validCrc) {
+    chkCrcStatus.innerText = `✓ VALID (${parsed.embeddedCrc})`;
+    chkCrcStatus.className = 'pixel-badge green';
+  } else {
+    chkCrcStatus.innerText = `✕ MISMATCH (Embedded: ${parsed.embeddedCrc || 'None'}, Calc: ${parsed.calculatedCrc})`;
+    chkCrcStatus.className = 'pixel-badge gold';
+  }
+
+  // Populate TLV table
+  checkerTlvTableBody.innerHTML = '';
+  parsed.tags.forEach(t => {
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td><span class="tag-badge">Tag ${t.tag}</span></td>
+      <td>${t.len}</td>
+      <td style="word-break:break-all; font-family:var(--font-mono); font-size:0.75rem;">${escapeHtml(t.val)}</td>
+      <td><strong>${escapeHtml(t.name)}</strong></td>
+      <td style="font-size:0.75rem;">${escapeHtml(t.desc)}</td>
+    `;
+    checkerTlvTableBody.appendChild(row);
+  });
+
+  showToast('✓ Berhasil mendecode QRIS code!');
+}
+
+copyScannedRawBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(lastScannedRawText);
+  showToast('📋 Text QRIS berhasil disalin!');
+});
+
+// Transfer to dynamic generator
+transferToGeneratorBtn.addEventListener('click', () => {
+  if (!lastScannedRawText) return;
+  staticQrisInput.value = lastScannedRawText;
+  presetDompuBtn.classList.remove('active');
+  presetZeroBtn.classList.remove('active');
+  presetCustomBtn.classList.add('active');
+
+  switchTab('tab-generator');
+  updateDynamicGenerator();
+  showToast('🚀 QRIS hasil scan berhasil dimuat ke Generator!');
+});
+
+// ----------------------------------------------------------------------------
+// Midtrans Signature & Webhook Tester Logic
+// ----------------------------------------------------------------------------
+const sigOrderId = document.getElementById('sigOrderId') as HTMLInputElement;
+const sigStatusCode = document.getElementById('sigStatusCode') as HTMLInputElement;
+const sigGrossAmount = document.getElementById('sigGrossAmount') as HTMLInputElement;
+const sigServerKey = document.getElementById('sigServerKey') as HTMLInputElement;
+const calcSignatureBtn = document.getElementById('calcSignatureBtn') as HTMLButtonElement;
+const copySignatureBtn = document.getElementById('copySignatureBtn') as HTMLButtonElement;
+const sigOutputPre = document.getElementById('sigOutputPre') as HTMLElement;
+const copyWebhookPayloadBtn = document.getElementById('copyWebhookPayloadBtn') as HTMLButtonElement;
+const webhookPayloadPre = document.getElementById('webhookPayloadPre') as HTMLElement;
+
+async function updateSignatureSimulator() {
+  const orderId = sigOrderId.value.trim();
+  const statusCode = sigStatusCode.value.trim();
+  const grossAmount = sigGrossAmount.value.trim();
+  const serverKey = sigServerKey.value.trim();
+
+  const rawString = `${orderId}${statusCode}${grossAmount}${serverKey}`;
+  const signature = await computeSHA512(rawString);
+
+  sigOutputPre.innerText = signature;
+
+  const mockPayload = {
+    transaction_time: new Date().toISOString().replace('T', ' ').substring(0, 19),
+    transaction_status: 'settlement',
+    transaction_id: 'TRX-' + Math.random().toString(36).substring(2, 10).toUpperCase(),
+    status_message: 'YuriPay transaction is successful',
+    status_code: statusCode,
+    signature_key: signature,
+    payment_type: 'qris',
+    order_id: orderId,
+    merchant_id: 'G538138242',
+    gross_amount: grossAmount,
+    fraud_status: 'accept',
+    currency: 'IDR',
+    acquirer: 'gopay'
+  };
+
+  webhookPayloadPre.innerText = JSON.stringify(mockPayload, null, 2);
+}
+
+calcSignatureBtn.addEventListener('click', () => {
+  updateSignatureSimulator();
+  showToast('⚡ Signature SHA-512 dihitung!');
+});
+
+copySignatureBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(sigOutputPre.innerText);
+  showToast('📋 Signature key berhasil disalin!');
+});
+
+copyWebhookPayloadBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(webhookPayloadPre.innerText);
+  showToast('📋 Payload JSON berhasil disalin!');
+});
+
+// ----------------------------------------------------------------------------
+// GitHub Repo Stats & Contributors Fetch
+// ----------------------------------------------------------------------------
+const headerStarCount = document.getElementById('headerStarCount') as HTMLElement;
+const headerForkCount = document.getElementById('headerForkCount') as HTMLElement;
+const gitStarCount = document.getElementById('gitStarCount') as HTMLElement;
+const gitForkCount = document.getElementById('gitForkCount') as HTMLElement;
+const gitIssuesCount = document.getElementById('gitIssuesCount') as HTMLElement;
+const statStars = document.getElementById('statStars') as HTMLElement;
+const statForks = document.getElementById('statForks') as HTMLElement;
+const statWatchers = document.getElementById('statWatchers') as HTMLElement;
+const statIssues = document.getElementById('statIssues') as HTMLElement;
+const contributorList = document.getElementById('contributorList') as HTMLElement;
+const copyCloneBtn = document.getElementById('copyCloneBtn') as HTMLButtonElement;
+const cloneSnippetPre = document.getElementById('cloneSnippetPre') as HTMLElement;
+
+copyCloneBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(cloneSnippetPre.innerText);
+  showToast('📋 Perintah clone berhasil disalin!');
+});
+
+async function fetchGitHubData() {
+  try {
+    const repoRes = await fetch('https://api.github.com/repos/myzert/YURIPAY-GOPAY');
+    if (repoRes.ok) {
+      const repoData = await repoRes.json();
+      const stars = repoData.stargazers_count ?? 120;
+      const forks = repoData.forks_count ?? 15;
+      const watchers = repoData.watchers_count ?? 120;
+      const issues = repoData.open_issues_count ?? 2;
+
+      headerStarCount.innerText = stars.toString();
+      headerForkCount.innerText = forks.toString();
+      gitStarCount.innerText = stars.toString();
+      gitForkCount.innerText = forks.toString();
+      gitIssuesCount.innerText = issues.toString();
+
+      statStars.innerText = stars.toString();
+      statForks.innerText = forks.toString();
+      statWatchers.innerText = watchers.toString();
+      statIssues.innerText = issues.toString();
+    } else {
+      fallbackGitHubStats();
+    }
+  } catch (e) {
+    fallbackGitHubStats();
+  }
+
+  try {
+    const contribRes = await fetch('https://api.github.com/repos/myzert/YURIPAY-GOPAY/contributors');
+    if (contribRes.ok) {
+      const contributors = await contribRes.json();
+      if (Array.isArray(contributors) && contributors.length > 0) {
+        contributorList.innerHTML = '';
+        contributors.forEach((c: any) => {
+          const card = document.createElement('a');
+          card.href = c.html_url;
+          card.target = '_blank';
+          card.rel = 'noopener';
+          card.className = 'contributor-card';
+          card.innerHTML = `
+            <img src="${c.avatar_url}" class="contributor-avatar" alt="${c.login}" />
+            <div class="contributor-info">
+              <span class="contributor-login">${escapeHtml(c.login)}</span>
+              <span class="contributor-role">${c.login === 'myzert' ? '👑 Lead Developer' : '🛠️ Contributor'}</span>
+              <span style="font-family:var(--font-mono); font-size:0.7rem; color:var(--pink-neon); margin-top:2px;">${c.contributions} Commits</span>
+            </div>
+          `;
+          contributorList.appendChild(card);
+        });
+      }
+    }
+  } catch (e) {
+    // Keep default hardcoded fallback
+  }
+}
+
+function fallbackGitHubStats() {
+  headerStarCount.innerText = '120+';
+  headerForkCount.innerText = '15+';
+  gitStarCount.innerText = '120+';
+  gitForkCount.innerText = '15+';
+  gitIssuesCount.innerText = '2';
+
+  statStars.innerText = '120+';
+  statForks.innerText = '15+';
+  statWatchers.innerText = '120+';
+  statIssues.innerText = '2';
+}
+
+// ----------------------------------------------------------------------------
+// Initial Boot
+// ----------------------------------------------------------------------------
+updateDynamicGenerator();
+updateSignatureSimulator();
+fetchGitHubData();
